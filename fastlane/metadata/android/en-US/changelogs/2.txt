@@ -1,0 +1,1 @@
+Detects the phone, ROM, CPU, GPU, OpenCL driver, root and every rear camera, and picks processing settings for the phone automatically. New "This phone" page with a copyable report for bug reports.

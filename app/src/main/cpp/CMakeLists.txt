@@ -15,6 +15,7 @@ add_library(parallax SHARED
     core/dense.cpp
     core/io.cpp
     live.cpp
+    probe.cpp
     jni_bridge.cpp)
 
 target_include_directories(parallax PRIVATE core)

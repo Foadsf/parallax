@@ -87,6 +87,7 @@ private sealed interface Screen {
     data object Scans : Screen
     data class Processing(val scan: Scan) : Screen
     data class Viewer(val scan: Scan) : Screen
+    data object Device : Screen
 }
 
 class MainActivity : ComponentActivity() {
@@ -125,6 +126,7 @@ class MainActivity : ComponentActivity() {
                         Screen.Scans -> ScansScreen()
                         is Screen.Processing -> ProcessingScreen(s.scan)
                         is Screen.Viewer -> ViewerScreen(s.scan)
+                        Screen.Device -> DeviceScreen()
                     }
                 }
             }
@@ -171,7 +173,7 @@ class MainActivity : ComponentActivity() {
         startedAt = SystemClock.elapsedRealtime()
         lifecycleScope.launch {
             val result = withContext(Dispatchers.Default) {
-                Reconstruction.run(scan) { st, f ->
+                Reconstruction.run(scan, DeviceProbe.processing(this@MainActivity)) { st, f ->
                     runOnUiThread { stage = st; fraction = f }
                     !cancel
                 }
@@ -369,7 +371,8 @@ class MainActivity : ComponentActivity() {
             Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 RoundButton(onClick = { go(Screen.Capture) }) { GlyphIcon(Glyph.Back, Ink) }
                 Spacer(Modifier.width(12.dp))
-                Text("Scans", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Medium)
+                Text("Scans", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                RoundButton(onClick = { go(Screen.Device) }) { GlyphIcon(Glyph.Info, Ink) }
             }
             if (scans.isEmpty()) Text("No scans yet.", color = Muted, modifier = Modifier.padding(24.dp))
             LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
@@ -410,6 +413,46 @@ class MainActivity : ComponentActivity() {
                 RoundButton(onClick = { process(s) }) { GlyphIcon(Glyph.Cube, Muted, 20.dp) }
             }
             RoundButton(onClick = onDelete) { GlyphIcon(Glyph.Trash, Muted, 20.dp) }
+        }
+    }
+
+    // ---- This phone -------------------------------------------------------------------------
+
+    @Composable
+    private fun DeviceScreen() {
+        BackHandler { go(Screen.Scans) }
+        var report by remember { mutableStateOf<DeviceReport?>(null) }
+        LaunchedEffect(Unit) { report = withContext(Dispatchers.IO) { DeviceProbe.report(this@MainActivity) } }
+        Column(Modifier.fillMaxSize()) {
+            Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                RoundButton(onClick = { go(Screen.Scans) }) { GlyphIcon(Glyph.Back, Ink) }
+                Spacer(Modifier.width(12.dp))
+                Text("This phone", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                RoundButton(onClick = {
+                    val r = report ?: return@RoundButton
+                    getSystemService(android.content.ClipboardManager::class.java)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("Parallax device report", r.asText()))
+                    Toast.makeText(this@MainActivity, "Report copied; paste it into a GitHub issue", Toast.LENGTH_LONG).show()
+                }) { GlyphIcon(Glyph.Copy, Ink) }
+            }
+            val r = report
+            if (r == null) {
+                Text("Checking the hardware…", color = Muted, modifier = Modifier.padding(24.dp))
+                return@Column
+            }
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                items(r.sections, key = { it.first }) { (title, rows) ->
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel).padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(title, color = Accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        for ((k, v) in rows) Column {
+                            Text(k, color = Muted, fontSize = 12.sp)
+                            Text(v, color = Ink, fontSize = 14.sp)
+                        }
+                    }
+                }
+            }
         }
     }
 

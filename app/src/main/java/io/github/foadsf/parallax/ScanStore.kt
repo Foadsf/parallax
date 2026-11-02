@@ -1,7 +1,6 @@
 package io.github.foadsf.parallax
 
 import android.content.Context
-import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -43,7 +42,7 @@ class Scan(val dir: File) {
         val o = JSONObject()
         o.put("format", 1)
         o.put("app", "Parallax ${BuildConfigCompat.versionName}")
-        o.put("device", "${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE})")
+        o.put("device", JSONObject(DeviceProbe.identity()))
         o.put("cameras", JSONArray().apply {
             for (c in cameras) put(JSONObject().apply {
                 put("index", c.index); put("label", c.label); put("cameraId", c.cameraId)

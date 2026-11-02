@@ -17,6 +17,12 @@ object NativeCore {
 
     external fun buildInfo(): String
 
+    /** ISA extensions reported by the kernel, e.g. "arm64 neon fp16 dotprod ... (ARMv8.2+)". */
+    external fun cpuFeatures(): String
+
+    /** The GPU behind the vendor OpenCL driver, or why apps cannot reach it. */
+    external fun openclSummary(): String
+
     external fun trackerReset()
 
     external fun trackerMarkKeyframe()

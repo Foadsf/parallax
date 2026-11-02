@@ -32,6 +32,21 @@ A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp ke
 
 The phone's NPU is not used. The pipeline is classical geometry, with no neural network to run, and Android's NNAPI is deprecated as of Android 15. OpenCV's Android build has no OpenCL, and Android does not guarantee OpenCL to apps, so dense matching runs on the CPU. A GPU compute (Vulkan or GLES 3.1) port of the SGM cost volume is a natural next step.
 
+## Your phone, detected automatically
+
+Parallax works out what it is running on at start-up, using public Android APIs only, and adapts:
+
+- **Phone and OS:** model, Android version, and the ROM (stock, LineageOS, /e/OS and others).
+- **Compute:** SoC, CPU clusters and clock speeds, ISA extensions, RAM, the GPU behind OpenGL ES, and whether the vendor OpenCL driver is reachable.
+- **Cameras:** each rear camera's hardware level, focal length, stream sizes, factory calibration, lens position, OIS, autofocus and torch levels, plus the capture modes they allow.
+- **Processing profile:** chosen from RAM and core count. *Full* (5 GB+, 8 cores), *balanced* (3 GB+) or *light* sets the feature and dense-matching resolutions.
+
+*Scans → ⓘ → This phone* shows all of this. The copy button puts it on the clipboard as a Markdown report: please paste it into bug reports. Each scan also records the phone, ROM and SoC in its `scan.json`.
+
+**Older phones and custom ROMs.** The native code targets the ARMv8.0 baseline, and OpenCV dispatches its ARMv8.2 kernels (dot product, FP16 arithmetic) at runtime, so it runs on older 64-bit SoCs such as the Exynos 8895. Rear cameras the camera HAL does not expose cannot be used, so on many older phones only the main lens is available and the model is unscaled.
+
+**Root is not used.** Parallax reports whether `su` is present but never runs it. On ROMs that publish `libOpenCL.so` in `public.libraries.txt`, the app reaches the GPU driver through `<uses-native-library>` without root. Root-only tweaks would not help reconstruction: copying vendor drivers, writing camera properties for cameras the HAL does not report, driving the torch LED through `sysfs` behind the camera HAL's back, or loosening file permissions.
+
 ## Build
 
 Needs Java 17+ and an Android SDK with platform `android-37.0`, build-tools `37.0.0`, NDK `30.0.16248370` and CMake `4.1.2`:
@@ -79,6 +94,7 @@ CI runs both on every push.
 |---|---|
 | `app/src/main/cpp/core/` | Platform-independent reconstruction: `features` (SIFT, matching), `geometry` (camera model, two-view, triangulation), `ba` (bundle adjustment), `sfm` (incremental driver, scale, gravity), `dense` (rectified SGM, fusion), `io` (PLY, COLMAP). |
 | `app/src/main/cpp/live.cpp` | Live keyframe selection (KLT with forward-backward check, Laplacian sharpness), YUV conversion, preview. |
+| `app/src/main/java/.../DeviceProbe.kt`, `app/src/main/cpp/probe.cpp` | Phone, ROM, CPU, GPU, OpenCL and camera detection; processing profile; device report. |
 | `app/src/main/java/.../CameraProbe.kt` | Rear-lens discovery, capture modes, stream intrinsics. |
 | `app/src/main/java/.../CaptureController.kt` | Camera2 session, locks, torch, keyframes, gravity. |
 | `app/src/main/java/.../MainActivity.kt` | Compose UI: capture, processing, viewer, scans. |

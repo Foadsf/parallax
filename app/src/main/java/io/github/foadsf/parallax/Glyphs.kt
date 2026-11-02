@@ -13,7 +13,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-enum class Glyph { Torch, TorchOff, TorchAuto, Stack, Back, Share, Download, Trash, Cube }
+enum class Glyph { Torch, TorchOff, TorchAuto, Stack, Back, Share, Download, Trash, Cube, Info, Copy }
 
 /** Line icons drawn on a 24-unit grid, so the app needs no icon library. */
 @Composable
@@ -54,6 +54,16 @@ fun GlyphIcon(g: Glyph, tint: Color, size: Dp = 24.dp, modifier: Modifier = Modi
                 drawLine(tint, p(4f, 6f), p(20f, 6f), stroke.width, StrokeCap.Round)
                 drawPath(path(9f to 6f, 9f to 3.5f, 15f to 3.5f, 15f to 6f), tint, style = stroke)
                 drawPath(path(6f to 6f, 7f to 20.5f, 17f to 20.5f, 18f to 6f), tint, style = stroke)
+            }
+            Glyph.Info -> {
+                drawCircle(tint, 9.5f * u, p(12f, 12f), style = stroke)
+                drawLine(tint, p(12f, 11f), p(12f, 17f), stroke.width, StrokeCap.Round)
+                drawCircle(tint, 1.3f * u, p(12f, 7.5f))
+            }
+            Glyph.Copy -> {
+                drawRoundRect(tint, topLeft = p(8f, 8f), size = androidx.compose.ui.geometry.Size(12f * u, 13f * u),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(2f * u), style = stroke)
+                drawPath(path(16f to 5f, 16f to 3.5f, 4f to 3.5f, 4f to 16f, 5.5f to 16f), tint, style = stroke)
             }
             Glyph.Cube -> {
                 drawPath(path(12f to 2.5f, 20.5f to 7f, 20.5f to 17f, 12f to 21.5f, 3.5f to 17f, 3.5f to 7f, close = true), tint, style = stroke)

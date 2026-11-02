@@ -5,7 +5,7 @@ import java.io.File
 
 object Reconstruction {
     /** Runs the native pipeline on [scan] (blocking). Returns the report, or an error message. */
-    fun run(scan: Scan, progress: NativeCore.Progress): Result<JSONObject> {
+    fun run(scan: Scan, processing: Processing, progress: NativeCore.Progress): Result<JSONObject> {
         val loaded = scan.load() ?: return Result.failure(IllegalStateException("scan.json is missing or damaged"))
         val cams = loaded.cameras
         val imgs = loaded.images.filter { File(scan.imagesDir, it.file).exists() }
@@ -23,8 +23,7 @@ object Reconstruction {
         }
         val up = FloatArray(imgs.size * 3)
         imgs.forEachIndexed { k, im -> im.up.copyInto(up, k * 3) }
-        // dense, featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages
-        val options = intArrayOf(1, 1600, 4000, 960, 40)
+        val options = processing.asOptions()
         val json = NativeCore.reconstruct(
             camArr, flags,
             imgs.map { File(scan.imagesDir, it.file).absolutePath }.toTypedArray(),

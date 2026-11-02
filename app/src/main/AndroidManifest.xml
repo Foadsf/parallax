@@ -28,6 +28,10 @@
             </intent-filter>
         </activity>
 
+        <!-- Vendor OpenCL is reachable from apps only when the ROM lists it in public.libraries.txt
+             and the app asks for it (targetSdk >= 31). Optional: the app runs without it. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.files"

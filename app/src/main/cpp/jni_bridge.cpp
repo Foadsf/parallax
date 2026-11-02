@@ -10,6 +10,7 @@
 
 #include "core.hpp"
 #include "live.hpp"
+#include "probe.hpp"
 
 #define LOG_TAG "Parallax"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -47,6 +48,14 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_buildInfo(JN
     const std::string info = "OpenCV " CV_VERSION ", " + std::to_string(cv::getNumberOfCPUs()) + " CPUs, " +
                              std::to_string(cv::getNumThreads()) + " threads";
     return env->NewStringUTF(info.c_str());
+}
+
+JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_cpuFeatures(JNIEnv* env, jobject) {
+    return env->NewStringUTF(cpuFeatures().c_str());
+}
+
+JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_openclSummary(JNIEnv* env, jobject) {
+    return env->NewStringUTF(openclSummary().c_str());
 }
 
 JNIEXPORT void JNICALL Java_io_github_foadsf_parallax_NativeCore_trackerReset(JNIEnv*, jobject) { gTracker.reset(); }
