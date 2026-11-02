@@ -1,0 +1,15 @@
+Parallax turns your phone into a 3D scanner. Walk slowly around an object; the app picks sharp keyframes as you move and then reconstructs a coloured 3D point cloud on the phone itself.
+
+<b>How it works</b>
+<ul>
+<li>Structure from Motion: SIFT features, five-point RANSAC, PnP registration and bundle adjustment with lens self-calibration.</li>
+<li>Dense stereo: rectified Semi-Global Matching, cross-checked between views and fused into one cloud with normals.</li>
+<li>On phones that can stream two rear cameras at once, the known distance between the lenses gives the model a true metric scale.</li>
+<li>The gravity sensor makes the model stand upright.</li>
+<li>The torch switches on automatically in dim light and stays constant during a scan.</li>
+</ul>
+
+<b>Export</b>
+Save the point cloud (PLY) to Downloads, or share the whole scan as a ZIP that opens directly in COLMAP, OpenMVS, MeshLab, CloudCompare or FreeCAD.
+
+No network permission, no analytics, no ads. Everything stays on the phone unless you share it.

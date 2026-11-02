@@ -1,0 +1,1 @@
+First release: capture with automatic keyframes, on-device SfM and dense reconstruction, PLY and COLMAP export.

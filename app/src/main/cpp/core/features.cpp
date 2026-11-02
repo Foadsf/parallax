@@ -1,0 +1,80 @@
+// Parallax: SIFT feature extraction (RootSIFT) and mutual ratio-test matching.
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include <opencv2/features2d.hpp>
+#include <opencv2/flann.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "internal.hpp"
+
+namespace parallax {
+
+bool extractFeatures(State& s, int imageIndex) {
+    Image& im = s.images[imageIndex];
+    cv::Mat gray = cv::imread(im.input.path, cv::IMREAD_GRAYSCALE);
+    if (gray.empty()) return false;
+
+    const double scale = std::min(1.0, s.opt.featureMaxSide / double(std::max(gray.cols, gray.rows)));
+    cv::Mat work;
+    if (scale < 1.0) cv::resize(gray, work, cv::Size(), scale, scale, cv::INTER_AREA);
+    else work = gray;
+
+    // Lowe's SIFT, the de-facto standard detector/descriptor for SfM (patent expired 2020).
+    auto sift = cv::SIFT::create(s.opt.maxFeatures, 3, 0.02, 10.0, 1.6);
+    std::vector<cv::KeyPoint> kps;
+    cv::Mat desc;
+    sift->detectAndCompute(work, cv::noArray(), kps, desc);
+
+    // RootSIFT (Arandjelovic & Zisserman 2012): L1-normalise, then square root.
+    for (int r = 0; r < desc.rows; ++r) {
+        float* d = desc.ptr<float>(r);
+        double l1 = 0;
+        for (int c = 0; c < desc.cols; ++c) l1 += d[c];
+        const float inv = l1 > 0 ? float(1.0 / l1) : 0.f;
+        for (int c = 0; c < desc.cols; ++c) d[c] = std::sqrt(d[c] * inv);
+    }
+
+    im.pixels.resize(kps.size());
+    const float inv = float(1.0 / scale);
+    for (size_t i = 0; i < kps.size(); ++i) {
+        // Keypoint centres follow OpenCV's pixel-centre convention, so a plain rescale suffices
+        // up to a sub-pixel shift: (x + 0.5) / s - 0.5.
+        im.pixels[i] = {(kps[i].pt.x + 0.5f) * inv - 0.5f, (kps[i].pt.y + 0.5f) * inv - 0.5f};
+    }
+    im.descriptors = desc;
+    im.track.assign(kps.size(), -1);
+    undistortKeypoints(s.cameras[im.camera], im.pixels, im.normalized);
+    return true;
+}
+
+static std::vector<cv::DMatch> knnBest(cv::flann::Index& index, const cv::Mat& query, float ratio) {
+    std::vector<cv::DMatch> out;
+    if (query.empty()) return out;
+    cv::Mat idx, dist;
+    index.knnSearch(query, idx, dist, 2, cv::flann::SearchParams(64));
+    for (int i = 0; i < query.rows; ++i) {
+        const float d0 = dist.at<float>(i, 0), d1 = dist.at<float>(i, 1);
+        // FLANN returns squared L2 distances.
+        if (d0 < ratio * ratio * d1) out.emplace_back(i, idx.at<int>(i, 0), d0);
+        else out.emplace_back(i, -1, d0);
+    }
+    return out;
+}
+
+std::vector<std::pair<int, int>> matchDescriptors(const cv::Mat& d1, const cv::Mat& d2, float ratio) {
+    std::vector<std::pair<int, int>> matches;
+    if (d1.rows < 8 || d2.rows < 8) return matches;
+    // Randomised kd-trees (Muja & Lowe), the approximate NN search used by most SfM systems.
+    cv::flann::Index i2(d2, cv::flann::KDTreeIndexParams(4));
+    cv::flann::Index i1(d1, cv::flann::KDTreeIndexParams(4));
+    auto fwd = knnBest(i2, d1, ratio);
+    auto bwd = knnBest(i1, d2, ratio);
+    for (const auto& m : fwd) {
+        if (m.trainIdx < 0) continue;
+        // Mutual nearest neighbour check.
+        if (bwd[m.trainIdx].trainIdx == m.queryIdx) matches.emplace_back(m.queryIdx, m.trainIdx);
+    }
+    return matches;
+}
+
+}  // namespace parallax
