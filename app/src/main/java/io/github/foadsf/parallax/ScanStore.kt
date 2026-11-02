@@ -17,6 +17,10 @@ data class ScanCamera(
 data class ScanImage(
     val file: String, val camera: Int, val rig: Int, val up: FloatArray,
     val timestampNs: Long, val exposureNs: Long, val iso: Int, val focusDiopters: Float, val torch: Boolean,
+    /** Rolling-shutter readout time (SENSOR_ROLLING_SHUTTER_SKEW), 0 if unknown. */
+    val rsSkewNs: Long = 0,
+    /** Gyroscope rate in camera axes (rad/s) at capture, or null. */
+    val gyro: FloatArray? = null,
 )
 
 /**
@@ -60,6 +64,8 @@ class Scan(val dir: File) {
                 put("up", JSONArray().apply { i.up.forEach { put(it.toDouble()) } })
                 put("timestampNs", i.timestampNs); put("exposureNs", i.exposureNs); put("iso", i.iso)
                 put("focusDiopters", i.focusDiopters.toDouble()); put("torch", i.torch)
+                put("rollingShutterSkewNs", i.rsSkewNs)
+                i.gyro?.let { g -> put("gyro", JSONArray().apply { g.forEach { put(it.toDouble()) } }) }
             })
         })
         val tmp = File(dir, "scan.json.tmp")
@@ -91,7 +97,9 @@ class Scan(val dir: File) {
                 val up = i.getJSONArray("up")
                 ScanImage(i.getString("file"), i.getInt("camera"), i.getInt("rig"),
                     FloatArray(3) { up.getDouble(it).toFloat() }, i.getLong("timestampNs"), i.getLong("exposureNs"),
-                    i.getInt("iso"), i.getDouble("focusDiopters").toFloat(), i.getBoolean("torch"))
+                    i.getInt("iso"), i.getDouble("focusDiopters").toFloat(), i.getBoolean("torch"),
+                    i.optLong("rollingShutterSkewNs", 0L),
+                    i.optJSONArray("gyro")?.let { g -> FloatArray(3) { g.getDouble(it).toFloat() } })
             }
         }
         Loaded(cams, imgs)

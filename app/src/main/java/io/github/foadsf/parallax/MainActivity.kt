@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.hardware.camera2.CameraManager
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -54,12 +55,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,6 +75,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
 
 private val Bg = Color(0xFF0B0D10)
 private val Panel = Color(0xFF15181D)
@@ -197,6 +201,10 @@ class MainActivity : ComponentActivity() {
             Centered("No rear camera found.", null) {}
             return
         }
+        val view = LocalView.current
+        LaunchedEffect(live.keyframes) {
+            if (live.keyframes > 0) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        }
         Column(Modifier.fillMaxSize()) {
             // Top bar: lens modes and torch.
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -229,6 +237,8 @@ class MainActivity : ComponentActivity() {
                         for (k in 0 until pts.size / 2) drawCircle(c, r, Offset(pts[2 * k] * size.width, pts[2 * k + 1] * size.height))
                     }
                     if (live.scanning) {
+                        CoverageDial(live.coverage, live.heading,
+                            Modifier.align(Alignment.TopStart).padding(10.dp).size(76.dp))
                         Text("${live.keyframes}", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
                                 .background(Color(0x99000000), RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 4.dp))
@@ -251,6 +261,39 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 Spacer(Modifier.size(52.dp))
+            }
+        }
+    }
+
+    /**
+     * Sides of the object already captured: outer ring = level views, inner ring = views from
+     * above, 24 sectors each, starting at the top with the first keyframe. The white tick marks
+     * where the phone is looking now.
+     */
+    @Composable
+    private fun CoverageDial(covered: BooleanArray, heading: Int, modifier: Modifier) {
+        Canvas(modifier.clip(CircleShape).background(Color(0x99000000))) {
+            val sweep = 360f / Coverage.SECTORS
+            val outerW = size.minDimension * 0.13f
+            val innerW = size.minDimension * 0.11f
+            val outerInset = outerW / 2 + size.minDimension * 0.06f
+            val innerInset = outerInset + outerW / 2 + innerW / 2 + size.minDimension * 0.04f
+            for (band in 0..1) {
+                val inset = if (band == 0) outerInset else innerInset
+                val w = if (band == 0) outerW else innerW
+                for (k in 0 until Coverage.SECTORS) {
+                    val on = covered.getOrElse(band * Coverage.SECTORS + k) { false }
+                    drawArc(if (on) Accent else Color.White.copy(alpha = 0.14f), -90f + k * sweep + 1.2f, sweep - 2.4f, false,
+                        topLeft = Offset(inset, inset), size = androidx.compose.ui.geometry.Size(size.width - 2 * inset, size.height - 2 * inset),
+                        style = Stroke(w))
+                }
+            }
+            if (heading >= 0) {
+                val inset = if (heading < Coverage.SECTORS) outerInset else innerInset
+                val k = heading % Coverage.SECTORS
+                drawArc(Color.White, -90f + k * sweep, sweep, false,
+                    topLeft = Offset(inset, inset), size = androidx.compose.ui.geometry.Size(size.width - 2 * inset, size.height - 2 * inset),
+                    style = Stroke(size.minDimension * 0.05f, cap = StrokeCap.Round))
             }
         }
     }
@@ -308,17 +351,17 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(view, dense) {
             val v = view ?: return@LaunchedEffect
             loading = true
-            val (cloud, cams) = withContext(Dispatchers.IO) {
+            val (cloud, frusta) = withContext(Dispatchers.IO) {
                 val c = Cloud.readPly(if (dense) scan.dense else scan.sparse)
-                val centres = report?.optJSONArray("cameraCentres")?.let { a -> FloatArray(a.length()) { a.getDouble(it).toFloat() } }
-                c to centres?.let { Cloud.markers(it) }
+                c to c?.let { Frusta.fromColmap(File(scan.dir, "sparse/0"), it.radius * 0.07f) }
             }
-            v.show(cloud, cams)
+            v.show(cloud, frusta)
             loading = false
         }
         Box(Modifier.fillMaxSize()) {
             AndroidView({ ctx -> PointCloudView(ctx).also { view = it } }, Modifier.fillMaxSize())
-            Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(Bg, Bg.copy(alpha = 0.95f), Bg.copy(alpha = 0.6f), Color.Transparent)))
+                .padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 36.dp), verticalAlignment = Alignment.CenterVertically) {
                 RoundButton(onClick = { go(Screen.Scans) }) { GlyphIcon(Glyph.Back, Ink) }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -335,8 +378,11 @@ class MainActivity : ComponentActivity() {
                 Chip("Sparse", !dense, enabled = true) { dense = false }
                 Spacer(Modifier.width(14.dp))
                 RoundButton(onClick = {
-                    val name = runCatching { Exporter.saveToDownloads(this@MainActivity, scan) }.getOrNull()
-                    Toast.makeText(this@MainActivity, name?.let { "Saved to Downloads: $it" } ?: "Could not save", Toast.LENGTH_LONG).show()
+                    // Copying tens of megabytes: off the main thread.
+                    lifecycleScope.launch {
+                        val name = withContext(Dispatchers.IO) { runCatching { Exporter.saveToDownloads(this@MainActivity, scan) }.getOrNull() }
+                        Toast.makeText(this@MainActivity, name?.let { "Saved to Downloads: $it" } ?: "Could not save", Toast.LENGTH_LONG).show()
+                    }
                 }) { GlyphIcon(Glyph.Download, Ink) }
                 Spacer(Modifier.width(6.dp))
                 RoundButton(onClick = { lifecycleScope.launch(Dispatchers.IO) { runCatching { Exporter.share(this@MainActivity, scan) } } }) {

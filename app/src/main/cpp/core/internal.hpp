@@ -3,9 +3,11 @@
 #pragma once
 
 #include <opencv2/core.hpp>
+#include <opencv2/flann.hpp>
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,11 +24,15 @@ struct Image {
     std::vector<cv::Point2f> pixels;      // keypoints, full-resolution pixels
     std::vector<cv::Point2d> normalized;  // undistorted, normalized image coordinates
     cv::Mat descriptors;                  // RootSIFT, CV_32F
+    std::shared_ptr<cv::flann::Index> index;  // kd-trees over descriptors, built once
     std::vector<int> track;               // per keypoint: track id or -1
     bool registered = false;
     cv::Matx33d R = cv::Matx33d::eye();   // world -> camera
     cv::Vec3d t = {0, 0, 0};
     cv::Vec3d centre() const { return -(R.t() * t); }
+    // Rolling-shutter motion during readout: angular rate (camera frame) and centre velocity (world).
+    bool rs = false;
+    cv::Vec3d omega = {0, 0, 0}, velocity = {0, 0, 0};
 };
 
 struct Observation {
@@ -66,9 +72,18 @@ struct State {
 
 // features.cpp
 bool extractFeatures(State& s, int imageIndex);
-std::vector<std::pair<int, int>> matchDescriptors(const cv::Mat& d1, const cv::Mat& d2, float ratio);
+std::vector<std::pair<int, int>> matchDescriptors(const Image& a, const Image& b, float ratio);
 
 // geometry.cpp
+// Camera-frame point of X seen at image row `row`. With a rolling shutter the camera has moved
+// by dt = skew (row / (H - 1) - 1/2) since the middle row (first order in dt):
+//   x = A (R X + t + offset),  A = I - dt [omega]x,  offset = -dt R v.
+struct RowMotion {
+    cv::Matx33d A = cv::Matx33d::eye();
+    cv::Vec3d offset = {0, 0, 0};
+};
+RowMotion rowMotion(const State& s, const Image& im, double row, const cv::Matx33d& R);
+cv::Point2d camToPixel(const CameraModel& c, const cv::Vec3d& p, bool* inFront = nullptr);
 cv::Matx33d cameraMatrix(const CameraModel& c);
 cv::Mat distortionVector(const CameraModel& c);
 cv::Point2d projectPoint(const CameraModel& c, const cv::Matx33d& R, const cv::Vec3d& t,

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <random>
 #include <string>
 
@@ -106,14 +107,13 @@ bool intersect(const cv::Vec3d& o, const cv::Vec3d& d, double& tHit, cv::Vec3d& 
     return tHit < 1e29;
 }
 
-struct Cam {
-    CameraModel model;
+struct Pose {
     cv::Matx33d R;  // world -> camera
-    cv::Vec3d t;
+    cv::Vec3d C;    // centre
 };
 
-cv::Mat render(const Cam& cam, std::mt19937& rng) {
-    const CameraModel& m = cam.model;
+// Renders with the camera pose of each image row, so a moving rolling-shutter camera is modelled.
+cv::Mat render(const CameraModel& m, const std::function<Pose(int row)>& poseAtRow) {
     std::vector<cv::Point2f> px;
     px.reserve(size_t(m.width) * m.height);
     for (int y = 0; y < m.height; ++y)
@@ -124,11 +124,12 @@ cv::Mat render(const Cam& cam, std::mt19937& rng) {
     cv::undistortPoints(px, nrm, K, D, cv::noArray(), cv::noArray(),
                         cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 1e-10));
     cv::Mat img(m.height, m.width, CV_8UC3);
-    const cv::Matx33d Rt = cam.R.t();
-    const cv::Vec3d C = -(Rt * cam.t);
     const cv::Vec3d light = cv::normalize(cv::Vec3d(0.4, -0.3, 1.0));
     cv::parallel_for_(cv::Range(0, m.height), [&](const cv::Range& r) {
-        for (int y = r.start; y < r.end; ++y)
+        for (int y = r.start; y < r.end; ++y) {
+            const Pose pose = poseAtRow(y);
+            const cv::Matx33d Rt = pose.R.t();
+            const cv::Vec3d& C = pose.C;
             for (int x = 0; x < m.width; ++x) {
                 const cv::Point2f& q = nrm[size_t(y) * m.width + x];
                 const cv::Vec3d d = cv::normalize(Rt * cv::Vec3d(q.x, q.y, 1.0));
@@ -144,6 +145,7 @@ cv::Mat render(const Cam& cam, std::mt19937& rng) {
                 img.at<cv::Vec3b>(y, x) = cv::Vec3b(cv::saturate_cast<uchar>(col[2]), cv::saturate_cast<uchar>(col[1]),
                                                     cv::saturate_cast<uchar>(col[0]));
             }
+        }
     });
     cv::Mat noise(img.size(), CV_16SC3);
     cv::randn(noise, 0, 2.0);
@@ -151,7 +153,6 @@ cv::Mat render(const Cam& cam, std::mt19937& rng) {
     img.convertTo(out, CV_16SC3);
     out += noise;
     out.convertTo(img, CV_8UC3);
-    (void)rng;
     return img;
 }
 
@@ -160,6 +161,27 @@ cv::Matx33d lookAt(const cv::Vec3d& C, const cv::Vec3d& target) {
     const cv::Vec3d x = cv::normalize(z.cross(cv::Vec3d(0, 0, 1)));  // camera x: right
     const cv::Vec3d y = z.cross(x);                                  // camera y: down
     return {x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]};
+}
+
+constexpr double kSecondsPerView = 0.8;
+
+// Orbit around the scene; with `wobble`, the aim also sways as a hand-held phone does
+// (about 0.25 rad/s peak), which a rolling shutter turns into row-dependent distortion.
+Pose trajectory(double t, int views, bool wobble) {
+    const double a = 2 * 3.14159265358979 * t / (views * kSecondsPerView);
+    const double radius = 0.55 + 0.05 * std::sin(3 * a), height = 0.32 + 0.04 * std::cos(2 * a);
+    const cv::Vec3d C(radius * std::cos(a), radius * std::sin(a), height);
+    cv::Vec3d target(0, 0, 0.06);
+    if (wobble) target += 0.04 * cv::Vec3d(std::sin(2 * 3.14159265358979 * 0.5 * t), std::cos(2 * 3.14159265358979 * 0.37 * t), 0);
+    return {lookAt(C, target), C};
+}
+
+// Angular rate in camera coordinates, as a gyroscope reports it: R(t+h) R(t)^T = exp(-[w h]x).
+cv::Vec3d gyroAt(double t, int views, bool wobble) {
+    const double h = 1e-4;
+    cv::Vec3d rv;
+    cv::Rodrigues(cv::Mat(trajectory(t + h, views, wobble).R * trajectory(t, views, wobble).R.t()), rv);
+    return -rv * (1.0 / h);
 }
 
 // Umeyama similarity: dst ~ s R src + t.
@@ -208,15 +230,17 @@ std::vector<cv::Vec3f> readPly(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <work-dir> [views] [--single] [--no-dense]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <work-dir> [views] [--single] [--no-dense] [--rs] [--no-rs-model]\n", argv[0]);
         return 2;
     }
     const fs::path work = argv[1];
     int views = 36;
-    bool rig = true, dense = true;
+    bool rig = true, dense = true, rs = false, rsModel = true;
     for (int a = 2; a < argc; ++a) {
         if (!std::strcmp(argv[a], "--single")) rig = false;
         else if (!std::strcmp(argv[a], "--no-dense")) dense = false;
+        else if (!std::strcmp(argv[a], "--rs")) rs = true;  // rolling-shutter images, hand-held sway
+        else if (!std::strcmp(argv[a], "--no-rs-model")) rsModel = false;
         else views = std::atoi(argv[a]);
     }
     fs::create_directories(work / "images");
@@ -241,48 +265,51 @@ int main(int argc, char** argv) {
 
     Options opt;
     opt.dense = dense;
+    opt.rollingShutter = rsModel;
+    const double skew = rs ? 0.030 : 0.0;  // 30 ms readout, typical of phone sensors
     Reconstructor rec(opt);
     rec.addCamera(wideGuess);
     if (rig) rec.addCamera(ultraGuess);
-    std::mt19937 rng(7);
     std::vector<cv::Vec3d> gtCentres;
     std::vector<cv::Vec3d> gtUp;
     const auto t0 = std::chrono::steady_clock::now();
     for (int v = 0; v < views; ++v) {
-        const double a = 2 * 3.14159265358979 * v / views;
-        const double radius = 0.55 + 0.05 * std::sin(3 * a), height = 0.32 + 0.04 * std::cos(2 * a);
-        Cam cw;
-        cw.model = wide;
-        const cv::Vec3d C(radius * std::cos(a), radius * std::sin(a), height);
-        cw.R = lookAt(C, {0, 0, 0.06});
-        cw.t = -(cw.R * C);
+        const double tv = v * kSecondsPerView;  // capture time of the middle row
+        const Pose mid = trajectory(tv, views, rs);
+        auto rowTime = [&](int row, const CameraModel& m) { return tv + skew * (double(row) / (m.height - 1) - 0.5); };
+        const char* tag = rs ? "_rs" : "";
         char name[64];
-        std::snprintf(name, sizeof name, "w_%03d_of_%03d.jpg", v, views);  // cached renders must match the view count
+        std::snprintf(name, sizeof name, "w_%03d_of_%03d%s.jpg", v, views, tag);  // cached renders must match
         const std::string pw = (work / "images" / name).string();
-        if (!fs::exists(pw)) cv::imwrite(pw, render(cw, rng), {cv::IMWRITE_JPEG_QUALITY, 95});
+        if (!fs::exists(pw))
+            cv::imwrite(pw, render(wide, [&](int row) { return trajectory(rowTime(row, wide), views, rs); }),
+                        {cv::IMWRITE_JPEG_QUALITY, 95});
         ImageInput iw;
         iw.path = pw;
         iw.cameraId = 0;
         iw.rigGroup = rig ? v : -1;
-        const cv::Vec3d up = cw.R * cv::Vec3d(0, 0, 1);
+        const cv::Vec3d up = mid.R * cv::Vec3d(0, 0, 1);
         iw.upX = up[0]; iw.upY = up[1]; iw.upZ = up[2];
+        iw.time = 10.0 + tv;
+        iw.rollingShutterSkew = skew;
+        const cv::Vec3d g = gyroAt(tv, views, rs);
+        iw.gyroX = g[0]; iw.gyroY = g[1]; iw.gyroZ = g[2];
+        iw.hasGyro = true;
         rec.addImage(iw);
-        gtCentres.push_back(C);
+        gtCentres.push_back(mid.C);
         if (rig) {
-            Cam cu;
-            cu.model = ultra;
-            cu.R = cw.R;  // parallel optical axes
-            // Lens offset of 12 mm along camera -y (upwards in the image).
-            const cv::Vec3d Cu = C + cw.R.t() * cv::Vec3d(0, -0.012, 0);
-            cu.t = -(cu.R * Cu);
-            std::snprintf(name, sizeof name, "u_%03d_of_%03d.jpg", v, views);
+            // Second lens 12 mm along camera -y (upwards in the image), parallel optical axes.
+            auto offset = [](const Pose& p) { return Pose{p.R, p.C + p.R.t() * cv::Vec3d(0, -0.012, 0)}; };
+            std::snprintf(name, sizeof name, "u_%03d_of_%03d%s.jpg", v, views, tag);
             const std::string pu = (work / "images" / name).string();
-            if (!fs::exists(pu)) cv::imwrite(pu, render(cu, rng), {cv::IMWRITE_JPEG_QUALITY, 95});
+            if (!fs::exists(pu))
+                cv::imwrite(pu, render(ultra, [&](int row) { return offset(trajectory(rowTime(row, ultra), views, rs)); }),
+                            {cv::IMWRITE_JPEG_QUALITY, 95});
             ImageInput iu = iw;
             iu.path = pu;
             iu.cameraId = 2;
             rec.addImage(iu);
-            gtCentres.push_back(Cu);
+            gtCentres.push_back(offset(mid).C);
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -290,7 +317,14 @@ int main(int argc, char** argv) {
 
     Result r = rec.run((work / "out").string(), work.string(), [](const std::string& stage, float f) {
         static std::string last;
-        if (stage != last) { std::printf("  [%5.1f%%] %s\n", f * 100, stage.c_str()); last = stage; }
+        static auto since = std::chrono::steady_clock::now();
+        if (stage != last) {
+            const auto now = std::chrono::steady_clock::now();
+            // Elapsed time belongs to the stage that just ended.
+            if (!last.empty()) std::printf("  %-22s %6.1f s\n", last.c_str(), std::chrono::duration<double>(now - since).count());
+            last = stage;
+            since = now;
+        }
         return true;
     });
     const auto t2 = std::chrono::steady_clock::now();
@@ -317,6 +351,13 @@ int main(int argc, char** argv) {
                 r.imagesTotal, rmsPos * 1000, s, upErrDeg);
 
     bool pass = r.imagesRegistered >= int(0.9 * r.imagesTotal) && rmsPos < 0.005 && upErrDeg < 2.0;
+    if (rs) {
+        // Uncorrected (--no-rs-model) this scene gives about 1.7 mm and must fail; corrected, it
+        // reaches the global-shutter level (~0.4 mm).
+        const bool rsOk = rmsPos < 0.001;
+        std::printf("rolling-shutter correction %s (pose RMS must be under 1 mm)\n", rsOk ? "OK" : "FAIL");
+        pass = pass && rsOk;
+    }
     if (rig) {
         const bool scaleOk = r.metresPerUnit > 0 && std::abs(s - 1.0) < 0.05;
         std::printf("metric scale %s (alignment scale %.4f should be 1)\n", scaleOk ? "OK" : "FAIL", s);

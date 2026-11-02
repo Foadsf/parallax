@@ -1,0 +1,1 @@
+Rolling-shutter-aware bundle adjustment: poses and metric scale stay accurate while the phone moves. Coverage dial in the viewfinder, a haptic tick per keyframe, camera frustums in the viewer, and faster image matching.

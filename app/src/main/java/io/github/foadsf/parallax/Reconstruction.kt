@@ -23,11 +23,18 @@ object Reconstruction {
         }
         val up = FloatArray(imgs.size * 3)
         imgs.forEachIndexed { k, im -> im.up.copyInto(up, k * 3) }
+        val motion = DoubleArray(imgs.size * 6)
+        imgs.forEachIndexed { k, im ->
+            val g = im.gyro
+            doubleArrayOf(im.timestampNs / 1e9, im.rsSkewNs / 1e9, g?.get(0)?.toDouble() ?: 0.0,
+                g?.get(1)?.toDouble() ?: 0.0, g?.get(2)?.toDouble() ?: 0.0, if (g != null) 1.0 else 0.0,
+            ).copyInto(motion, k * 6)
+        }
         val options = processing.asOptions()
         val json = NativeCore.reconstruct(
             camArr, flags,
             imgs.map { File(scan.imagesDir, it.file).absolutePath }.toTypedArray(),
-            imgs.map { it.camera }.toIntArray(), imgs.map { it.rig }.toIntArray(), up,
+            imgs.map { it.camera }.toIntArray(), imgs.map { it.rig }.toIntArray(), up, motion,
             scan.dir.absolutePath, scan.imagesDir.absolutePath, options, progress,
         )
         val report = runCatching { JSONObject(json) }.getOrElse { return Result.failure(it) }

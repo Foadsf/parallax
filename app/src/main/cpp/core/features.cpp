@@ -42,6 +42,8 @@ bool extractFeatures(State& s, int imageIndex) {
         im.pixels[i] = {(kps[i].pt.x + 0.5f) * inv - 0.5f, (kps[i].pt.y + 0.5f) * inv - 0.5f};
     }
     im.descriptors = desc;
+    // Randomised kd-trees (Muja & Lowe), built once per image and shared by all its pairs.
+    if (desc.rows >= 8) im.index = std::make_shared<cv::flann::Index>(im.descriptors, cv::flann::KDTreeIndexParams(4));
     im.track.assign(kps.size(), -1);
     undistortKeypoints(s.cameras[im.camera], im.pixels, im.normalized);
     return true;
@@ -61,14 +63,12 @@ static std::vector<cv::DMatch> knnBest(cv::flann::Index& index, const cv::Mat& q
     return out;
 }
 
-std::vector<std::pair<int, int>> matchDescriptors(const cv::Mat& d1, const cv::Mat& d2, float ratio) {
+std::vector<std::pair<int, int>> matchDescriptors(const Image& a, const Image& b, float ratio) {
     std::vector<std::pair<int, int>> matches;
-    if (d1.rows < 8 || d2.rows < 8) return matches;
-    // Randomised kd-trees (Muja & Lowe), the approximate NN search used by most SfM systems.
-    cv::flann::Index i2(d2, cv::flann::KDTreeIndexParams(4));
-    cv::flann::Index i1(d1, cv::flann::KDTreeIndexParams(4));
-    auto fwd = knnBest(i2, d1, ratio);
-    auto bwd = knnBest(i1, d2, ratio);
+    if (!a.index || !b.index) return matches;
+    // Searching a built index is read-only, so pairs sharing an image can run in parallel.
+    auto fwd = knnBest(*b.index, a.descriptors, ratio);
+    auto bwd = knnBest(*a.index, b.descriptors, ratio);
     for (const auto& m : fwd) {
         if (m.trainIdx < 0) continue;
         // Mutual nearest neighbour check.

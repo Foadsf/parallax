@@ -103,11 +103,12 @@ JNIEXPORT jboolean JNICALL Java_io_github_foadsf_parallax_NativeCore_saveJpeg(JN
 // cameras: 15 doubles per camera:
 //   id, width, height, fx, fy, cx, cy, k1, k2, p1, p2, k3, lensX, lensY, lensZ
 // cameraFlags: per camera, bit 0 = calibrated, bit 1 = has lens position.
-// images: paths; imageCams/imageRig per image; imageUp: 3 floats per image.
+// images: paths; imageCams/imageRig per image; imageUp: 3 floats per image;
+// imageMotion: 6 doubles per image: time (s), rolling-shutter skew (s), gyro x y z, has gyro.
 // options: [dense(0/1), featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages]
 JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
     JNIEnv* env, jobject, jdoubleArray cameras, jintArray cameraFlags, jobjectArray images, jintArray imageCams,
-    jintArray imageRig, jfloatArray imageUp, jstring outDir, jstring imageRoot, jintArray options, jobject progress) {
+    jintArray imageRig, jfloatArray imageUp, jdoubleArray imageMotion, jstring outDir, jstring imageRoot, jintArray options, jobject progress) {
     Options opt;
     {
         jint o[5];
@@ -143,6 +144,8 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
     env->GetIntArrayRegion(imageCams, 0, ni, cams.data());
     env->GetIntArrayRegion(imageRig, 0, ni, rig.data());
     env->GetFloatArrayRegion(imageUp, 0, ni * 3, up.data());
+    std::vector<jdouble> motion(size_t(ni) * 6);
+    env->GetDoubleArrayRegion(imageMotion, 0, ni * 6, motion.data());
     for (int i = 0; i < ni; ++i) {
         auto js = static_cast<jstring>(env->GetObjectArrayElement(images, i));
         ImageInput in;
@@ -153,6 +156,11 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
         in.upX = up[3 * i];
         in.upY = up[3 * i + 1];
         in.upZ = up[3 * i + 2];
+        const double* mo = &motion[size_t(i) * 6];
+        in.time = mo[0];
+        in.rollingShutterSkew = mo[1];
+        in.gyroX = mo[2]; in.gyroY = mo[3]; in.gyroZ = mo[4];
+        in.hasGyro = mo[5] > 0.5;
         rec.addImage(in);
     }
 

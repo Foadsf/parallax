@@ -20,6 +20,8 @@ jobs:
         run: cmake -S tools/host-test -B build/host-test && cmake --build build/host-test -j
       - name: Single camera, sparse
         run: build/host-test/synth_test "$RUNNER_TEMP/single" 36 --single --no-dense
+      - name: Rolling shutter, single camera, sparse
+        run: build/host-test/synth_test "$RUNNER_TEMP/rs" 36 --single --no-dense --rs
       - name: Two-camera rig, dense
         run: build/host-test/synth_test "$RUNNER_TEMP/rig" 36
 

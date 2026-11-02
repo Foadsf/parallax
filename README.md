@@ -3,6 +3,7 @@
 A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp keyframes as you move, then reconstructs a coloured 3D point cloud on the phone, with no cloud service.
 
 - **Structure from Motion**: SIFT (RootSIFT) features, mutual ratio-test matching, Nistér five-point RANSAC, incremental registration with P3P-RANSAC + Levenberg-Marquardt, multi-view DLT triangulation and a sparse Schur-complement bundle adjustment that also self-calibrates each lens (focal length, k1, k2).
+- **Rolling shutter**: phone sensors read rows one after another (10–33 ms). Each keyframe records the readout time (`SENSOR_ROLLING_SHUTTER_SKEW`) and the gyroscope rate. Bundle adjustment then projects every observation with the camera pose at that row's capture time, using the gyro rotation and a velocity from the neighbouring keyframes.
 - **Dense stereo**: for every keyframe, the two best neighbours are rectified and matched with Semi-Global Matching. The disparity range comes from the sparse model, the two depth maps are cross-checked, and all views are fused in a voxel grid with normals.
 - **Two rear cameras, metric scale**: if the phone can stream two physical rear cameras in the same request, Parallax captures both. The factory lens positions (`LENS_POSE_TRANSLATION`) fix the scale, so the model comes out in metres. With one camera the shape is right but the scale is arbitrary.
 - **Gravity-up**: the gravity sensor makes +Z point up in the exported model.
@@ -16,8 +17,9 @@ A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp ke
 
 1. Pick an object with texture (print, wood grain, fabric, labels). Plain white or shiny surfaces give few features. Put it on a textured surface, such as a newspaper.
 2. Keep the object filling about half of the frame and walk **around** it in one or two rings at different heights. Turning on the spot gives no parallax.
-3. Move slowly. The ring around the shutter fills as you move; a keyframe is taken when it is full and the image is sharp. 30–80 keyframes is a good scan.
-4. Tap stop. Reconstruction takes from about a minute to several minutes, depending on the phone and the number of keyframes. Keep the app open.
+3. Move slowly. The ring around the shutter fills as you move; a keyframe is taken when it is full and the image is sharp (the phone ticks). 30–80 keyframes is a good scan.
+4. Watch the coverage dial in the corner of the viewfinder. Its outer ring is the sides seen from level, its inner ring the views from above. Keep going until both are mostly filled; the white mark shows where you are looking now.
+5. Tap stop. Reconstruction takes from about a minute to several minutes, depending on the phone and the number of keyframes. Keep the app open.
 
 ## How the hardware is used
 
@@ -84,7 +86,12 @@ Results on 2026-11-02 (Linux x86-64, OpenCV 4.14.0, 36 orbit positions, 1280×96
 | One camera, dense | 36/36 | 0.46 mm | n/a | 0.04° | 1.22 M | 0.73 / 1.78 mm |
 | Two-camera rig, dense | 72/72 | 0.15 mm | within 0.15 % | 0.01° | 1.73 M | 0.99 / 2.06 mm |
 
-The scene is about 0.6 m from the cameras. Bundle adjustment recovers the lens parameters from the 3 %-off start: focal length within 0.05 %, k1 and k2 within 0.002. A synthetic scene is not a phone: it has no motion blur, rolling shutter, auto-exposure drift or specular surfaces. It checks the geometry, not real-world robustness.
+| One camera, rolling shutter, correction off | 36/36 | 1.71 mm | n/a | 0.03° | n/a | n/a |
+| One camera, rolling shutter, correction on | 36/36 | 0.42 mm | n/a | 0.02° | n/a | n/a |
+
+The rolling-shutter rows render each image row from the camera pose at that row's time (30 ms readout), along an orbit with a hand-held sway of about 0.25 rad/s. Run them with `synth_test <dir> 36 --single --no-dense --rs` and add `--no-rs-model` to switch the correction off.
+
+The scene is about 0.6 m from the cameras. Bundle adjustment recovers the lens parameters from the 3 %-off start: focal length within 0.05 %, k1 and k2 within 0.002. A synthetic scene is not a phone: it has no motion blur, auto-exposure drift or specular surfaces, and its rolling shutter is an ideal one. It checks the geometry, not real-world robustness.
 
 CI runs both on every push.
 
@@ -104,6 +111,7 @@ CI runs both on every push.
 
 - Output is a point cloud with normals, not a mesh. Use Poisson reconstruction in MeshLab or CloudCompare, or OpenMVS on the exported COLMAP project.
 - Metric scale needs simultaneous streams from two rear cameras. Many phones do not offer this to third-party apps, and the app then falls back to one lens. Which modes your phone offers shows as chips at the top of the capture screen.
+- Dense matching still assumes a global shutter. On the synthetic rolling-shutter rig, correcting the poses improved them five-fold, but the dense surface error rose from 0.70 to 0.87 mm (median). Making the rectified stereo rolling-shutter aware is open work.
 - Reconstruction runs in the foreground; leaving the app during processing may stop it.
 - Shiny, transparent and textureless surfaces do not reconstruct well. That is a limit of passive photogrammetry.
 

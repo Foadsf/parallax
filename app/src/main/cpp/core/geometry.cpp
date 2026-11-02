@@ -16,7 +16,21 @@ cv::Mat distortionVector(const CameraModel& c) {
 
 cv::Point2d projectPoint(const CameraModel& c, const cv::Matx33d& R, const cv::Vec3d& t,
                          const cv::Vec3d& X, bool* inFront) {
-    const cv::Vec3d p = R * X + t;
+    return camToPixel(c, R * X + t, inFront);
+}
+
+RowMotion rowMotion(const State& s, const Image& im, double row, const cv::Matx33d& R) {
+    RowMotion m;
+    if (!im.rs) return m;
+    const CameraModel& c = s.cameras[im.camera];
+    const double dt = im.input.rollingShutterSkew * (row / std::max(1, c.height - 1) - 0.5);
+    const cv::Vec3d w = im.omega * dt;
+    m.A = cv::Matx33d(1, w[2], -w[1], -w[2], 1, w[0], w[1], -w[0], 1);  // I - [w]x
+    m.offset = -dt * (R * im.velocity);
+    return m;
+}
+
+cv::Point2d camToPixel(const CameraModel& c, const cv::Vec3d& p, bool* inFront) {
     if (inFront) *inFront = p[2] > 1e-9;
     const double z = std::abs(p[2]) > 1e-12 ? p[2] : 1e-12;
     const double a = p[0] / z, b = p[1] / z;
@@ -88,7 +102,9 @@ double triangulationAngleDeg(const cv::Vec3d& X, const cv::Vec3d& c1, const cv::
 double reprojectionError(const State& s, const Point3D& p, const Observation& o) {
     const Image& im = s.images[o.image];
     bool front = false;
-    const cv::Point2d uv = projectPoint(s.cameras[im.camera], im.R, im.t, p.X, &front);
+    const cv::Point2f& obs = im.pixels[o.keypoint];
+    const RowMotion m = rowMotion(s, im, obs.y, im.R);
+    const cv::Point2d uv = camToPixel(s.cameras[im.camera], m.A * (im.R * p.X + im.t + m.offset), &front);
     if (!front) return 1e9;
     return cv::norm(uv - cv::Point2d(im.pixels[o.keypoint]));
 }

@@ -45,7 +45,40 @@ data class LiveState(
     val hint: String = "",
     val modeLabel: String = "",
     val metric: Boolean = false,
+    /** Viewing directions covered by keyframes: 24 azimuth sectors x 2 elevation bands. */
+    val coverage: BooleanArray = BooleanArray(Coverage.BINS),
+    /** Current viewing direction's bin, or -1 when unknown. */
+    val heading: Int = -1,
 )
+
+/**
+ * Which sides of the object have been seen, from the phone's orientation: the rear camera's
+ * viewing direction (game rotation vector, gyro + accelerometer) binned by azimuth relative to
+ * the first keyframe and by elevation (level vs looking down by more than 35 degrees).
+ */
+object Coverage {
+    const val SECTORS = 24
+    const val BINS = 2 * SECTORS
+
+    fun bin(rotationVector: FloatArray, azimuth0: Double): Int {
+        val r = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(r, rotationVector)
+        // Rear camera looks along device -Z; in world coordinates that is -(third column).
+        val dx = -r[2].toDouble(); val dy = -r[5].toDouble(); val dz = -r[8].toDouble()
+        val az = Math.atan2(dx, dy)
+        var rel = (az - azimuth0) / (2 * Math.PI)
+        rel -= Math.floor(rel)
+        val sector = (rel * SECTORS).toInt().coerceIn(0, SECTORS - 1)
+        val high = dz < -0.574  // sin 35 degrees
+        return if (high) SECTORS + sector else sector
+    }
+
+    fun azimuth(rotationVector: FloatArray): Double {
+        val r = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(r, rotationVector)
+        return Math.atan2(-r[2].toDouble(), -r[5].toDouble())
+    }
+}
 
 /**
  * Camera2 capture: one YUV stream per lens (two for a rig), live keyframe selection in native
@@ -95,6 +128,11 @@ class CaptureController(
     // Sensors (main thread writes, camera thread reads).
     @Volatile private var gravity = FloatArray(3)
     @Volatile private var gyroRate = 0f
+    @Volatile private var gyro = FloatArray(3)          // rad/s, device axes
+    @Volatile private var rotation: FloatArray? = null  // game rotation vector
+    private var rsSkewNs = 0L
+    private var azimuth0 = 0.0
+    private val coverage = BooleanArray(Coverage.BINS)
 
     fun open(m: CaptureMode) {
         close()
@@ -104,6 +142,7 @@ class CaptureController(
         val g = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         g?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         handler!!.post { openCamera(m) }
     }
 
@@ -131,6 +170,8 @@ class CaptureController(
         images.clear()
         keyframes = 0
         NativeCore.trackerReset()
+        coverage.fill(false)
+        azimuth0 = rotation?.let { Coverage.azimuth(it) } ?: 0.0
         scanning = true
         triggerFocusLock()
         repeat()
@@ -300,6 +341,7 @@ class CaptureController(
             exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureNs
             iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: iso
             focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: focusDiopters
+            rsSkewNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: rsSkewNs
             updateTorch(force = false)
         }
     }
@@ -388,16 +430,18 @@ class CaptureController(
         val s = scan ?: return
         val up = upInCamera(cameras[0].sensorOrientation)
         val group = keyframes
+        val w = gyro
         if (writeJpeg(primary, File(s.imagesDir, "p_%04d.jpg".format(group)))) {
             images += ScanImage("p_%04d.jpg".format(group), 0, if (rig) group else -1, up, primary.timestamp,
-                exposureNs, iso, focusDiopters, torchOn)
+                exposureNs, iso, focusDiopters, torchOn, rsSkewNs, toCamera(cameras[0].sensorOrientation, w))
         } else return
+        rotation?.let { coverage[Coverage.bin(it, azimuth0)] = true }
         val sec = heldSecondary
         // Same request, so the timestamps should agree; accept up to 10 ms for unsynchronised HALs.
         if (rig && sec != null && kotlin.math.abs(sec.timestamp - primary.timestamp) < 10_000_000L) {
             if (writeJpeg(sec, File(s.imagesDir, "s_%04d.jpg".format(group)))) {
                 images += ScanImage("s_%04d.jpg".format(group), 1, group, upInCamera(cameras[1].sensorOrientation),
-                    sec.timestamp, exposureNs, iso, focusDiopters, torchOn)
+                    sec.timestamp, exposureNs, iso, focusDiopters, torchOn, rsSkewNs, toCamera(cameras[1].sensorOrientation, w))
             }
         }
         keyframes++
@@ -432,17 +476,21 @@ class CaptureController(
      * Gravity reaction ("up") in OpenCV camera coordinates (x right, y down, z forward) of a rear
      * camera with the given SENSOR_ORIENTATION, from the device-frame gravity sensor.
      */
-    private fun upInCamera(orientation: Int): FloatArray {
-        val g = gravity
+    private fun upInCamera(orientation: Int): FloatArray = toCamera(orientation, gravity)
+
+    /** A device-frame vector (gravity, angular rate) in the rear camera's OpenCV axes. */
+    private fun toCamera(orientation: Int, v: FloatArray): FloatArray {
         val th = Math.toRadians(orientation.toDouble())
         val c = cos(th).toFloat()
         val s = sin(th).toFloat()
-        return floatArrayOf(c * g[0] - s * g[1], -s * g[0] - c * g[1], -g[2])
+        return floatArrayOf(c * v[0] - s * v[1], -s * v[0] - c * v[1], -v[2])
     }
 
     private fun publish(newHint: String?) {
+        val heading = rotation?.let { Coverage.bin(it, azimuth0) } ?: -1
         val st = LiveState(lastPoints, lastProgress, lastTracked, keyframes, scanning, torchOn,
-            newHint ?: hint, mode?.label ?: "", rig && cameras.size == 2 && cameras.all { it.position != null })
+            newHint ?: hint, mode?.label ?: "", rig && cameras.size == 2 && cameras.all { it.position != null },
+            coverage.copyOf(), heading)
         main.post { onState(st) }
     }
 
@@ -458,7 +506,10 @@ class CaptureController(
             Sensor.TYPE_GYROSCOPE -> {
                 val w = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2])
                 gyroRate = 0.7f * gyroRate + 0.3f * w
+                val g = gyro
+                gyro = FloatArray(3) { 0.5f * g[it] + 0.5f * e.values[it] }
             }
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> rotation = e.values.copyOf()
         }
     }
 

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 
 #include "internal.hpp"
@@ -38,11 +39,10 @@ struct Params {
 
 double huberCost(double e, double d) { return e <= d ? e * e : 2 * d * e - d * d; }
 
-// Residual and Jacobians of one observation. Returns false when the point is behind the camera.
-bool linearise(const CameraModel& c, const cv::Matx33d& R, const cv::Vec3d& t, const cv::Vec3d& X,
-               const cv::Point2f& uv, double r[2], double Jx[2][3] /* d(u,v)/d(x_cam) */,
-               double Ji[2][3] /* d(u,v)/d(fscale,k1,k2) */) {
-    const cv::Vec3d p = R * X + t;
+// Residual and Jacobians of one observation at camera-frame point p. Returns false when the
+// point is behind the camera.
+bool linearise(const CameraModel& c, const cv::Vec3d& p, const cv::Point2f& uv, double r[2],
+               double Jx[2][3] /* d(u,v)/d(x_cam) */, double Ji[2][3] /* d(u,v)/d(fscale,k1,k2) */) {
     if (p[2] <= 1e-6) return false;
     const double iz = 1.0 / p[2];
     const double a = p[0] * iz, b = p[1] * iz;
@@ -137,8 +137,12 @@ double bundleAdjust(State& s, const BAOptions& o) {
             double Jx[2][3], Ji[2][3];
             const auto is = intrSlot.find(im.camera);
             const bool intr = is != intrSlot.end();
-            if (!linearise(c, P.R[t.image], P.t[t.image], P.X[t.point], im.pixels[t.keypoint], t.r, Jx,
-                           intr ? Ji : nullptr)) {
+            const cv::Matx33d& R = P.R[t.image];
+            const cv::Point2f& obs = im.pixels[t.keypoint];
+            // Rolling shutter: x = A y with y = R X + t + offset (identity for a global shutter).
+            const RowMotion m = rowMotion(s, im, obs.y, R);
+            const cv::Vec3d y = R * P.X[t.point] + P.t[t.image] + m.offset;
+            if (!linearise(c, m.A * y, obs, t.r, Jx, intr ? Ji : nullptr)) {
                 t.w = 0;
                 cost += huberCost(50.0, o.huberPx);  // constant penalty, keeps the cost comparable
                 continue;
@@ -147,16 +151,22 @@ double bundleAdjust(State& s, const BAOptions& o) {
             cost += huberCost(e, o.huberPx);
             if (!withJacobians) continue;
             t.w = e <= o.huberPx ? 1.0 : o.huberPx / e;
-            // d(x_cam)/dX = R
-            const cv::Matx33d& R = P.R[t.image];
+            // Chain through A: d(u,v)/dy = Jx A.
+            double JA[2][3];
+            for (int r = 0; r < 2; ++r)
+                for (int q = 0; q < 3; ++q)
+                    JA[r][q] = Jx[r][0] * m.A(0, q) + Jx[r][1] * m.A(1, q) + Jx[r][2] * m.A(2, q);
+            std::memcpy(Jx, JA, sizeof JA);
+            // dy/dX = R
             for (int r = 0; r < 2; ++r)
                 for (int q = 0; q < 3; ++q)
                     t.Jp[r][q] = Jx[r][0] * R(0, q) + Jx[r][1] * R(1, q) + Jx[r][2] * R(2, q);
             t.nidx = 0;
             const auto ps = poseSlot.find(t.image);
             if (ps != poseSlot.end()) {
-                // Left perturbation: x' = exp(w) x + dt  =>  dx/dw = -[x]x, dx/ddt = I.
-                const cv::Vec3d x = R * P.X[t.point] + P.t[t.image];
+                // Left perturbation: y' = exp(w) y + dt  =>  dy/dw = -[y]x, dy/ddt = I
+                // (the rolling-shutter offset R v is held fixed within a step).
+                const cv::Vec3d x = y;
                 for (int r = 0; r < 2; ++r) {
                     const double* j = Jx[r];
                     // j * (-[x]x)

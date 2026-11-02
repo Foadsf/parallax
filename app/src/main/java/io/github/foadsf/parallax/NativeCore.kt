@@ -48,6 +48,8 @@ object NativeCore {
     external fun reconstruct(
         cameras: DoubleArray, cameraFlags: IntArray,
         images: Array<String>, imageCams: IntArray, imageRig: IntArray, imageUp: FloatArray,
+        /** Per image: time (s), rolling-shutter readout (s), gyro x y z (rad/s, camera axes), has gyro (0/1). */
+        imageMotion: DoubleArray,
         outDir: String, imageRoot: String, options: IntArray, progress: Progress,
     ): String
 }

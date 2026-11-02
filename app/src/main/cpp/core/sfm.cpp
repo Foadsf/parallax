@@ -84,7 +84,7 @@ public:
             cv::parallel_for_(cv::Range(start, end), [&](const cv::Range& r) {
                 for (int k = r.start; k < r.end; ++k) {
                     const int a = cand[k].first, b = cand[k].second;
-                    const auto m = matchDescriptors(s_.images[a].descriptors, s_.images[b].descriptors, s_.opt.ratioTest);
+                    const auto m = matchDescriptors(s_.images[a], s_.images[b], s_.opt.ratioTest);
                     ok[k] = verifyPair(s_, a, b, m, geo[k]) ? 1 : 0;
                 }
             });
@@ -188,11 +188,61 @@ public:
         // Final refinement: retriangulate, then refine intrinsics jointly with everything else.
         for (size_t k = 0; k < s_.tracks.size(); ++k) triangulateTrack(s_, int(k));
         globalBA(false, 10);
+        // Rolling shutter: model each row's capture time once the poses are good enough to
+        // give the camera velocity; re-estimate it after the first refinement.
+        estimateMotion();
         rms_ = globalBA(true, 25);
         filterPoints(true);
+        estimateMotion();
         rms_ = globalBA(true, 10);
         filterPoints(true);
         return registered() >= 2;
+    }
+
+    // Per-image readout motion: angular rate from the gyroscope (or, without one, from the
+    // neighbouring keyframes' rotations) and centre velocity from the neighbouring keyframes of
+    // the same camera, by central differences over capture time.
+    void estimateMotion() {
+        if (!s_.opt.rollingShutter) return;
+        std::vector<int> idx;
+        for (size_t i = 0; i < s_.images.size(); ++i) {
+            const Image& im = s_.images[i];
+            if (im.registered && im.input.rollingShutterSkew > 0 && im.input.time > 0) idx.push_back(int(i));
+        }
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return s_.images[a].input.time < s_.images[b].input.time; });
+        int modelled = 0;
+        for (int i : idx) {
+            Image& im = s_.images[i];
+            int prev = -1, next = -1;
+            for (int j : idx) {
+                const Image& o = s_.images[j];
+                if (o.camera != im.camera || j == i) continue;
+                const double dt = o.input.time - im.input.time;
+                if (dt < -1e-3 && dt > -4.0 && (prev < 0 || o.input.time > s_.images[prev].input.time)) prev = j;
+                if (dt > 1e-3 && dt < 4.0 && (next < 0 || o.input.time < s_.images[next].input.time)) next = j;
+            }
+            const int a = prev >= 0 ? prev : i, b = next >= 0 ? next : i;
+            if (a == b) { im.rs = false; continue; }
+            const Image& A = s_.images[a];
+            const Image& B = s_.images[b];
+            const double span = B.input.time - A.input.time;
+            im.velocity = (B.centre() - A.centre()) * (1.0 / span);
+            if (im.input.hasGyro) {
+                im.omega = {im.input.gyroX, im.input.gyroY, im.input.gyroZ};
+            } else {
+                // R_b R_a^T = exp(-[w span]x) in camera coordinates.
+                cv::Vec3d rv;
+                cv::Rodrigues(cv::Mat(B.R * A.R.t()), rv);
+                im.omega = -rv * (1.0 / span);
+            }
+            im.rs = true;
+            ++modelled;
+        }
+        if (modelled) {
+            std::ostringstream ss;
+            ss << "rolling shutter modelled for " << modelled << " images\n";
+            if (log_.find("rolling shutter") == std::string::npos) log_ += ss.str();
+        }
     }
 
     int registered() const {
@@ -443,6 +493,7 @@ void transformModel(State& s, const cv::Matx33d& G, const cv::Vec3d& c, double s
         const cv::Matx33d R = im.R;
         im.t = scale * (R * c + im.t);
         im.R = R * G.t();
+        im.velocity = scale * (G * im.velocity);  // the angular rate is in camera axes: unchanged
     }
 }
 

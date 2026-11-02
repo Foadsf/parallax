@@ -31,6 +31,11 @@ struct ImageInput {
     int rigGroup = -1;
     // "Up" (reaction to gravity) in camera coordinates (x right, y down, z forward); zero if unknown.
     double upX = 0, upY = 0, upZ = 0;
+    // Rolling shutter: capture time of the first row (s), readout time from the first to the last
+    // row (s, SENSOR_ROLLING_SHUTTER_SKEW) and the gyroscope rate in camera coordinates (rad/s).
+    double time = 0, rollingShutterSkew = 0;
+    double gyroX = 0, gyroY = 0, gyroZ = 0;
+    bool hasGyro = false;
 };
 
 struct Options {
@@ -43,6 +48,7 @@ struct Options {
     bool dense = true;
     int denseMaxSide = 960;
     int maxDenseImages = 48;
+    bool rollingShutter = true;    // model row-wise capture time in bundle adjustment
 };
 
 struct Result {
