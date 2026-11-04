@@ -5,7 +5,8 @@ A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp ke
 - **Structure from Motion**: SIFT (RootSIFT) features, mutual ratio-test matching, Nistér five-point RANSAC, incremental registration with P3P-RANSAC + Levenberg-Marquardt, multi-view DLT triangulation and a sparse Schur-complement bundle adjustment that also self-calibrates each lens (focal length, k1, k2).
 - **Rolling shutter**: phone sensors read rows one after another (10–33 ms). Each keyframe records the readout time (`SENSOR_ROLLING_SHUTTER_SKEW`) and the gyroscope rate. Bundle adjustment then projects every observation with the camera pose at that row's capture time, using the gyro rotation and a velocity from the neighbouring keyframes.
 - **Dense stereo**: for every keyframe, the two best neighbours are rectified and matched with Semi-Global Matching. The disparity range comes from the sparse model, the two depth maps are cross-checked, and all views are fused in a voxel grid with normals.
-- **Two rear cameras, metric scale**: if the phone can stream two physical rear cameras in the same request, Parallax captures both. The factory lens positions (`LENS_POSE_TRANSLATION`) fix the scale, so the model comes out in metres. With one camera the shape is right but the scale is arbitrary.
+- **Two rear cameras, metric scale**: if the phone can stream two physical rear cameras in the same request, Parallax captures both. The factory lens positions (`LENS_POSE_TRANSLATION`) fix the scale, so the model comes out in metres.
+- **Scale marker, any phone**: print the [ArUco marker](docs/scale-marker-60mm.svg) (4×4 dictionary, id 0, 60 mm), lay it flat next to the object, and enter its measured edge under *Scans → ruler*. The marker's corners are triangulated in the model and its edge sets the scale, so single-camera phones get metres too. Without a marker or a lens pair, the shape is right but the scale is arbitrary.
 - **Gravity-up**: the gravity sensor makes +Z point up in the exported model.
 - **Camera control**: the factory intrinsics and distortion (`LENS_INTRINSIC_CALIBRATION`, `LENS_DISTORTION`) are mapped into the stream. During a scan, exposure, white balance and focus are locked. OIS, EIS and HAL distortion correction are turned off where the camera allows.
 - **Torch**: Auto turns the torch on when auto-exposure needs more than about 1/30 s at ISO 800, and never switches it mid-scan, since lighting must stay constant across views. You can force it on or off.
@@ -17,9 +18,10 @@ A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp ke
 
 1. Pick an object with texture (print, wood grain, fabric, labels). Plain white or shiny surfaces give few features. Put it on a textured surface, such as a newspaper.
 2. Keep the object filling about half of the frame and walk **around** it in one or two rings at different heights. Turning on the spot gives no parallax.
-3. Move slowly. The ring around the shutter fills as you move; a keyframe is taken when it is full and the image is sharp (the phone ticks). 30–80 keyframes is a good scan.
+3. Move slowly. Each tracked point draws a trail back to where it was at the last keyframe, and the ring around the shutter fills as the trails grow. A keyframe is taken when the ring is full, focus has locked and the image is sharp (the phone ticks). The hint line says what is holding it back: focusing, too dark, glare, blur or too fast. 30–80 keyframes is a good scan.
 4. Watch the coverage dial in the corner of the viewfinder. Its outer ring is the sides seen from level, its inner ring the views from above. Keep going until both are mostly filled; the white mark shows where you are looking now.
-5. Tap stop. Reconstruction takes from about a minute to several minutes, depending on the phone and the number of keyframes. Keep the app open.
+5. Tap stop. Reconstruction takes from about a minute to several minutes, depending on the phone and the number of keyframes. It runs in a foreground service with a progress notification, so you can switch apps or lock the phone.
+6. In the viewer, drag to orbit, pinch to zoom and drag with two fingers to pan. The buttons on the right change the point size, show or hide the cameras, and recentre the view. The floor grid has 10 cm squares when the model is metric.
 
 ## How the hardware is used
 
@@ -29,6 +31,7 @@ A free Android 3D scanner. Walk slowly around an object; Parallax picks sharp ke
 | GPU | OpenGL ES 3 point-cloud viewer. |
 | Camera ISP | YUV streams, auto-exposure / white balance / focus, then locked for the scan. |
 | Rear cameras | One, or two physical cameras of a logical multi-camera, for metric scale. |
+| Storage | Keyframes are encoded and written by a background thread, so tracking never waits for the disk. |
 | Gravity sensor, gyroscope | Up direction per keyframe; keyframes are skipped while the phone turns fast (motion blur). |
 | Torch | Automatic in dim light. |
 
@@ -76,18 +79,23 @@ The C++ core in [`app/src/main/cpp/core`](app/src/main/cpp/core) is plain C++17 
 cmake -S tools/host-test -B build/host-test && cmake --build build/host-test -j
 build/host-test/synth_test /tmp/parallax-synth 36            # two-camera rig + dense
 build/host-test/synth_test /tmp/parallax-single 36 --single --no-dense
+build/host-test/synth_test /tmp/parallax-single 36 --single --no-dense --marker   # 60 mm ArUco on the ground
 ```
 
-Results on 2026-11-02 (Linux x86-64, OpenCV 4.14.0, 36 orbit positions, 1280×960 images):
+The marker case needs OpenCV 4.7 or newer, where ArUco is part of `objdetect`; with older OpenCV the core builds without marker support.
+
+Results on 2026-11-04 (Linux x86-64, OpenCV 4.14.0, 36 orbit positions, 1280×960 images):
 
 | Case | Registered | Camera position error (RMS) | Metric scale | Gravity error | Dense points | Surface error (median / 90th pct) |
 |---|---|---|---|---|---|---|
-| One camera, sparse | 36/36 | 0.46 mm | n/a | 0.04° | n/a | n/a |
-| One camera, dense | 36/36 | 0.46 mm | n/a | 0.04° | 1.22 M | 0.73 / 1.78 mm |
-| Two-camera rig, dense | 72/72 | 0.15 mm | within 0.15 % | 0.01° | 1.73 M | 0.99 / 2.06 mm |
+| One camera, sparse | 36/36 | 0.33–0.38 mm | n/a | 0.00–0.02° | n/a | n/a |
+| One camera, dense | 36/36 | 0.33 mm | n/a | 0.02° | 1.23 M | 0.75 / 1.78 mm |
+| One camera + 60 mm marker, sparse | 36/36 | 0.33 mm | within 0.31 % | 0.02° | n/a | n/a |
+| Two-camera rig, dense | 72/72 | 0.12 mm | within 0.18 % | 0.01° | 1.67 M | 0.99 / 2.01 mm |
+| One camera, rolling shutter, correction off | 36/36 | 1.71 mm | n/a | 0.04° | n/a | n/a |
+| One camera, rolling shutter, correction on | 36/36 | 0.39 mm | n/a | 0.01° | n/a | n/a |
 
-| One camera, rolling shutter, correction off | 36/36 | 1.71 mm | n/a | 0.03° | n/a | n/a |
-| One camera, rolling shutter, correction on | 36/36 | 0.42 mm | n/a | 0.02° | n/a | n/a |
+Matching and RANSAC run on several threads, so repeated runs differ slightly (about 0.05 mm in pose error).
 
 The rolling-shutter rows render each image row from the camera pose at that row's time (30 ms readout), along an orbit with a hand-held sway of about 0.25 rad/s. Run them with `synth_test <dir> 36 --single --no-dense --rs` and add `--no-rs-model` to switch the correction off.
 
@@ -105,14 +113,15 @@ CI runs both on every push.
 | `app/src/main/java/.../CameraProbe.kt` | Rear-lens discovery, capture modes, stream intrinsics. |
 | `app/src/main/java/.../CaptureController.kt` | Camera2 session, locks, torch, keyframes, gravity. |
 | `app/src/main/java/.../MainActivity.kt` | Compose UI: capture, processing, viewer, scans. |
-| `app/src/main/java/.../PointCloudView.kt` | OpenGL ES 3 viewer (orbit, pinch, pan, double-tap to reset). |
+| `app/src/main/java/.../ReconstructionService.kt` | Foreground service that runs the reconstruction, with progress and cancel. |
+| `app/src/main/java/.../PointCloudView.kt` | OpenGL ES 3 viewer: normal-lit points, floor grid, camera frustums (orbit, pinch, pan, double-tap to reset). |
+| `docs/scale-marker-60mm.svg` | Printable scale marker (A4, print at 100 %); `tools/host-test/make_marker.cpp` generates others. |
 
 ## Limitations
 
 - Output is a point cloud with normals, not a mesh. Use Poisson reconstruction in MeshLab or CloudCompare, or OpenMVS on the exported COLMAP project.
-- Metric scale needs simultaneous streams from two rear cameras. Many phones do not offer this to third-party apps, and the app then falls back to one lens. Which modes your phone offers shows as chips at the top of the capture screen.
+- Metric scale needs the printed marker or simultaneous streams from two rear cameras. Many phones do not offer two streams to third-party apps, and the app then falls back to one lens. Which modes your phone offers shows as chips at the top of the capture screen. Marker scale assumes the marker lies flat and was measured after printing.
 - Dense matching still assumes a global shutter. On the synthetic rolling-shutter rig, correcting the poses improved them five-fold, but the dense surface error rose from 0.70 to 0.87 mm (median). Making the rectified stereo rolling-shutter aware is open work.
-- Reconstruction runs in the foreground; leaving the app during processing may stop it.
 - Shiny, transparent and textureless surfaces do not reconstruct well. That is a limit of passive photogrammetry.
 
 ## Contributing

@@ -30,8 +30,8 @@ object NativeCore {
     /**
      * Draws the frame into [preview] (rotated clockwise by [rotation]) and, when [track] is set,
      * runs the keyframe tracker. [out] receives
-     * `[progress, sharpness, meanY, darkRatio, clipRatio, keyframe, tracked]`; [pts] receives
-     * normalised point coordinates in the sensor frame. Returns the number of points.
+     * `[progress, sharpness, meanY, darkRatio, clipRatio, keyframe, tracked, sharp]`; [pts] receives
+     * per point `x, y, anchorX, anchorY` normalised in the sensor frame (anchor = at the last keyframe). Returns the number of points.
      */
     external fun trackFrame(
         y: ByteBuffer, u: ByteBuffer, v: ByteBuffer, width: Int, height: Int,

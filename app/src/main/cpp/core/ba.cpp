@@ -189,8 +189,26 @@ double bundleAdjust(State& s, const BAOptions& o) {
         return cost;
     };
 
+    // Factory-calibrated lenses (LENS_INTRINSIC_CALIBRATION) get a Gaussian prior on focal scale
+    // (1 %) and k1, k2 (0.02): weak against well-conditioned data, decisive when the geometry
+    // leaves the intrinsics unconstrained.
+    constexpr double kSigmaF = 0.01, kSigmaK = 0.02;
+    auto priorOf = [&](int cam) -> const CameraModel* {
+        return cam < int(s.priors.size()) && s.priors[cam].calibrated ? &s.priors[cam] : nullptr;
+    };
+    auto priorCost = [&](const Params& P) {
+        double c = 0;
+        for (const auto& kv : intrSlot)
+            if (const CameraModel* p0 = priorOf(kv.first)) {
+                const CameraModel& c1 = P.cam[kv.first];
+                c += std::pow((c1.fx / p0->fx - 1) / kSigmaF, 2) + std::pow((c1.k1 - p0->k1) / kSigmaK, 2) +
+                     std::pow((c1.k2 - p0->k2) / kSigmaK, 2);
+            }
+        return c;
+    };
+
     double lambda = 1e-3;
-    double cost = evaluate(cur, true);
+    double cost = evaluate(cur, true) + priorCost(cur);
     const double cost0 = cost;
     int accepts = 0;
     const int np = int(pts.size());
@@ -201,8 +219,10 @@ double bundleAdjust(State& s, const BAOptions& o) {
         cv::Mat gc = cv::Mat::zeros(n, 1, CV_64F);
         std::vector<cv::Matx33d> Pb(np, cv::Matx33d::zeros());
         std::vector<cv::Vec3d> gp(np, cv::Vec3d(0, 0, 0));
+        std::vector<int> active(np, 0);  // observations currently in front of their camera
         for (const auto& t : terms) {
             if (t.w == 0) continue;
+            active[t.point]++;
             cv::Matx33d& Pj = Pb[t.point];
             for (int a = 0; a < 3; ++a) {
                 gp[t.point][a] += t.w * (t.Jp[0][a] * t.r[0] + t.Jp[1][a] * t.r[1]);
@@ -215,6 +235,18 @@ double bundleAdjust(State& s, const BAOptions& o) {
                     row[t.idx[b]] += t.w * (t.Jc[0][a] * t.Jc[0][b] + t.Jc[1][a] * t.Jc[1][b]);
             }
         }
+        for (const auto& kv : intrSlot)
+            if (const CameraModel* p0 = priorOf(kv.first)) {
+                const CameraModel& c1 = cur.cam[kv.first];
+                const int b = 6 * nPose + 3 * kv.second;
+                const double jf = c1.fx / p0->fx / kSigmaF, rf = (c1.fx / p0->fx - 1) / kSigmaF;
+                C.at<double>(b, b) += jf * jf;
+                gc.at<double>(b) += jf * rf;
+                C.at<double>(b + 1, b + 1) += 1 / (kSigmaK * kSigmaK);
+                gc.at<double>(b + 1) += (c1.k1 - p0->k1) / (kSigmaK * kSigmaK);
+                C.at<double>(b + 2, b + 2) += 1 / (kSigmaK * kSigmaK);
+                gc.at<double>(b + 2) += (c1.k2 - p0->k2) / (kSigmaK * kSigmaK);
+            }
         // Per point: merged coupling rows E_j (camera index -> 3-vector).
         std::vector<std::vector<std::pair<int, cv::Vec3d>>> Ej(np);
         for (const auto& t : terms) {
@@ -237,6 +269,11 @@ double bundleAdjust(State& s, const BAOptions& o) {
             for (int i = 0; i < n; ++i) S.at<double>(i, i) += lambda * C.at<double>(i, i) + 1e-9;
             std::vector<cv::Matx33d> Pinv(np);
             for (int j = 0; j < np; ++j) {
+                if (active[j] < 2) {
+                    // Rank-deficient block (one view, or none in front): hold the point this step.
+                    Pinv[j] = cv::Matx33d::zeros();
+                    continue;
+                }
                 cv::Matx33d Pd = Pb[j];
                 for (int a = 0; a < 3; ++a) Pd(a, a) += lambda * Pb[j](a, a) + 1e-9;
                 Pinv[j] = Pd.inv(cv::DECOMP_CHOLESKY);
@@ -248,6 +285,15 @@ double bundleAdjust(State& s, const BAOptions& o) {
                     for (size_t b = 0; b < list.size(); ++b) row[list[b].first] -= list[a].second.dot(F[b]);
                     rhs.at<double>(list[a].first) += F[a].dot(gp[j]);
                 }
+            }
+            // Scale gauge: pin one translation component of a second image.
+            const auto gs = poseSlot.find(o.scaleGaugeImage);
+            if (gs != poseSlot.end()) {
+                const int g = 6 * gs->second + 3 + o.scaleGaugeAxis;
+                S.row(g).setTo(0);
+                S.col(g).setTo(0);
+                S.at<double>(g, g) = 1;
+                rhs.at<double>(g) = 0;
             }
             cv::Mat dc;
             if (!cv::solve(S, rhs, dc, cv::DECOMP_CHOLESKY)) {
@@ -276,11 +322,11 @@ double bundleAdjust(State& s, const BAOptions& o) {
                 c.k1 += d[1];
                 c.k2 += d[2];
             }
-            const double newCost = evaluate(cand, false);
+            const double newCost = evaluate(cand, false) + priorCost(cand);
             if (newCost < cost) {
                 const double rel = (cost - newCost) / std::max(cost, 1e-12);
                 cur = std::move(cand);
-                cost = evaluate(cur, true);
+                cost = evaluate(cur, true) + priorCost(cur);
                 lambda = std::max(1e-7, lambda * 0.3);
                 accepted = true;
                 ++accepts;

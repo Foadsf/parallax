@@ -19,8 +19,20 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-/** Interleaved vertices: x, y, z (float) + r, g, b, a (ubyte) = 16 bytes. */
-class Cloud(val data: ByteBuffer, val count: Int, val centre: FloatArray, val radius: Float) {
+/**
+ * Interleaved vertices, 20 bytes: x, y, z (float), r, g, b, a (ubyte), nx, ny, nz (signed byte,
+ * normalised; zero for lines and for points without a normal), pad.
+ */
+const val STRIDE = 20
+
+private fun ByteBuffer.putVertex(x: Float, y: Float, z: Float, rgba: Int, nx: Float = 0f, ny: Float = 0f, nz: Float = 0f) {
+    putFloat(x).putFloat(y).putFloat(z)
+    put((rgba ushr 24).toByte()).put((rgba ushr 16).toByte()).put((rgba ushr 8).toByte()).put(rgba.toByte())
+    put((nx * 127f).toInt().toByte()).put((ny * 127f).toInt().toByte()).put((nz * 127f).toInt().toByte()).put(0)
+}
+
+/** [floorZ]: low percentile of z, where the ground grid goes (the model is Z-up). */
+class Cloud(val data: ByteBuffer, val count: Int, val centre: FloatArray, val radius: Float, val floorZ: Float = 0f) {
     companion object {
         /** Reads the binary PLY written by the native core (x y z nx ny nz red green blue). */
         fun readPly(f: File): Cloud? = runCatching {
@@ -36,32 +48,58 @@ class Cloud(val data: ByteBuffer, val count: Int, val centre: FloatArray, val ra
                     }
                     header.append(line).append('\n')
                     if (line.startsWith("element vertex")) n = line.substring(15).trim().toInt()
-                    if (line.toString() == "end_header" || header.length > 4096) break
+                    if (line.toString().trim() == "end_header" || header.length > 4096) break
                 }
                 val raw = ByteArray(n * 27)
                 input.readFully(raw)
                 val src = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-                val dst = ByteBuffer.allocateDirect(n * 16).order(ByteOrder.nativeOrder())
+                val dst = ByteBuffer.allocateDirect(n * STRIDE).order(ByteOrder.nativeOrder())
                 val xs = FloatArray(n); val ys = FloatArray(n); val zs = FloatArray(n)
                 for (i in 0 until n) {
                     val o = i * 27
                     val x = src.getFloat(o); val y = src.getFloat(o + 4); val z = src.getFloat(o + 8)
                     xs[i] = x; ys[i] = y; zs[i] = z
-                    dst.putFloat(x).putFloat(y).putFloat(z)
-                    dst.put(raw[o + 24]).put(raw[o + 25]).put(raw[o + 26]).put(0xFF.toByte())
+                    val rgba = ((raw[o + 24].toInt() and 0xFF) shl 24) or ((raw[o + 25].toInt() and 0xFF) shl 16) or
+                        ((raw[o + 26].toInt() and 0xFF) shl 8) or 0xFF
+                    dst.putVertex(x, y, z, rgba, src.getFloat(o + 12), src.getFloat(o + 16), src.getFloat(o + 20))
                 }
                 dst.flip()
-                val centre = floatArrayOf(median(xs), median(ys), median(zs))
+                // quantile() sorts, so give it copies: xs/ys/zs must stay paired by index below.
+                val centre = floatArrayOf(quantile(xs.copyOf(), 0.5f), quantile(ys.copyOf(), 0.5f), quantile(zs.copyOf(), 0.5f))
+                val floorZ = quantile(zs.copyOf(), 0.02f)
                 val d = FloatArray(n) { i ->
                     val dx = xs[i] - centre[0]; val dy = ys[i] - centre[1]; val dz = zs[i] - centre[2]
                     sqrt(dx * dx + dy * dy + dz * dz)
                 }
-                val radius = if (n == 0) 1f else d.sorted()[(n * 9) / 10].coerceAtLeast(1e-4f)
-                Cloud(dst, n, centre, radius)
+                val radius = if (n == 0) 1f else quantile(d, 0.9f).coerceAtLeast(1e-4f)
+                Cloud(dst, n, centre, radius, floorZ)
             }
         }.getOrNull()
 
-        private fun median(v: FloatArray): Float = if (v.isEmpty()) 0f else v.sortedArray()[v.size / 2]
+        /** Sorts in place (primitive array: no boxing of millions of floats). */
+        private fun quantile(v: FloatArray, q: Float): Float {
+            if (v.isEmpty()) return 0f
+            v.sort()
+            return v[((v.size - 1) * q).toInt()]
+        }
+
+        /** Ground grid at [z] around the cloud: 10 cm lines when the scale is metric. */
+        fun grid(c: Cloud, metric: Boolean): Cloud {
+            val half = c.radius * 1.6f
+            val step = if (metric) {
+                listOf(0.01f, 0.05f, 0.1f, 0.5f, 1f).firstOrNull { half * 2 / it <= 30 } ?: 1f
+            } else half / 6
+            val n = (half / step).toInt()
+            val lines = ByteBuffer.allocateDirect((4 * (2 * n + 1)) * STRIDE).order(ByteOrder.nativeOrder())
+            val cx = c.centre[0]; val cy = c.centre[1]; val z = c.floorZ
+            for (k in -n..n) {
+                val a = 0x343B44FF
+                lines.putVertex(cx + k * step, cy - n * step, z, a); lines.putVertex(cx + k * step, cy + n * step, z, a)
+                lines.putVertex(cx - n * step, cy + k * step, z, a); lines.putVertex(cx + n * step, cy + k * step, z, a)
+            }
+            lines.flip()
+            return Cloud(lines, 4 * (2 * n + 1), c.centre, c.radius)
+        }
 
     }
 }
@@ -106,11 +144,8 @@ object Frusta {
             }
         }
         val n = lines.size / 3
-        val dst = ByteBuffer.allocateDirect(n * 16).order(ByteOrder.nativeOrder())
-        for (i in 0 until n) {
-            dst.putFloat(lines[3 * i]).putFloat(lines[3 * i + 1]).putFloat(lines[3 * i + 2])
-            dst.put(0x5E.toByte()).put(0xEA.toByte()).put(0xD4.toByte()).put(0xC0.toByte())
-        }
+        val dst = ByteBuffer.allocateDirect(n * STRIDE).order(ByteOrder.nativeOrder())
+        for (i in 0 until n) dst.putVertex(lines[3 * i], lines[3 * i + 1], lines[3 * i + 2], 0x5EEAD4FF)
         dst.flip()
         Cloud(dst, n, floatArrayOf(0f, 0f, 0f), 1f)
     }.getOrNull()
@@ -118,10 +153,18 @@ object Frusta {
 
 @SuppressLint("ViewConstructor")
 class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.Renderer {
-    @Volatile private var pending: Pair<Cloud?, Cloud?>? = null
+    private class Scene(val cloud: Cloud?, val frusta: Cloud?, val grid: Cloud?)
+    @Volatile private var pending: Scene? = null
     private var cloud: Cloud? = null
     private var frusta: Cloud? = null
-    private val vbo = IntArray(2)
+    private var grid: Cloud? = null
+    private val vbo = IntArray(3)
+
+    /** Point size multiplier, set from the UI. */
+    @Volatile var pointScale = 1f
+        set(v) { field = v; requestRender() }
+    @Volatile var showFrusta = true
+        set(v) { field = v; requestRender() }
     private var program = 0
     private val proj = FloatArray(16)
     private val view = FloatArray(16)
@@ -144,18 +187,19 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         renderMode = RENDERMODE_WHEN_DIRTY
     }
 
-    fun show(c: Cloud?, cams: Cloud?) {  // cams: frustum line segments
+    /** [cams]: frustum line segments; [metric]: the model is in metres (grid in 10 cm steps). */
+    fun show(c: Cloud?, cams: Cloud?, metric: Boolean = false) {
         if (c != null) {
             home = c.centre.copyOf()
             target = home.copyOf()
             homeDistance = c.radius * 3.2f
             distance = homeDistance
         }
-        pending = c to cams
+        pending = Scene(c, cams, c?.let { Cloud.grid(it, metric) })
         requestRender()
     }
 
-    private fun resetView() {
+    fun resetView() {
         target = home.copyOf(); distance = homeDistance; yaw = -1.2f; pitch = 0.45f
         requestRender()
     }
@@ -214,8 +258,8 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         GLES30.glClearColor(0.043f, 0.051f, 0.063f, 1f)
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
         program = link(VS, FS)
-        GLES30.glGenBuffers(2, vbo, 0)
-        cloud?.let { pending = it to frusta }
+        GLES30.glGenBuffers(3, vbo, 0)
+        if (cloud != null) pending = Scene(cloud, frusta, grid)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -225,10 +269,10 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     }
 
     override fun onDrawFrame(gl: GL10?) {
-        pending?.let { (c, m) ->
+        pending?.let { sc ->
             pending = null
-            cloud = c; frusta = m
-            upload(0, c); upload(1, m)
+            cloud = sc.cloud; frusta = sc.frusta; grid = sc.grid
+            upload(0, cloud); upload(1, frusta); upload(2, grid)
         }
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
         val c = cloud ?: return
@@ -241,12 +285,16 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
         GLES30.glUseProgram(program)
         GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uMvp"), 1, false, mvp, 0)
+        GLES30.glUniform3f(GLES30.glGetUniformLocation(program, "uEye"), ex, ey, ez)
         // World-space point diameter, about 0.4 % of the cloud radius, projected to pixels.
         val pxPerUnit = heightPx / (2f * 0.4142f)
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSize"), c.radius * 0.008f * pxPerUnit)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSize"), c.radius * 0.008f * pxPerUnit * pointScale)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uPoints"), 0f)
+        GLES30.glLineWidth(1f)
+        grid?.let { draw(2, it.count, GLES30.GL_LINES) }
         GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uPoints"), 1f)
         draw(0, c.count, GLES30.GL_POINTS)
-        frusta?.let {
+        frusta?.takeIf { showFrusta }?.let {
             GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uPoints"), 0f)
             GLES30.glLineWidth(2f)
             draw(1, it.count, GLES30.GL_LINES)
@@ -256,16 +304,18 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     private fun upload(slot: Int, c: Cloud?) {
         if (c == null) return
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[slot])
-        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, c.count * 16, c.data, GLES30.GL_STATIC_DRAW)
+        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, c.count * STRIDE, c.data, GLES30.GL_STATIC_DRAW)
     }
 
     private fun draw(slot: Int, count: Int, mode: Int) {
         if (count == 0) return
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[slot])
         GLES30.glEnableVertexAttribArray(0)
-        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 16, 0)
+        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, STRIDE, 0)
         GLES30.glEnableVertexAttribArray(1)
-        GLES30.glVertexAttribPointer(1, 4, GLES30.GL_UNSIGNED_BYTE, true, 16, 12)
+        GLES30.glVertexAttribPointer(1, 4, GLES30.GL_UNSIGNED_BYTE, true, STRIDE, 12)
+        GLES30.glEnableVertexAttribArray(2)
+        GLES30.glVertexAttribPointer(2, 3, GLES30.GL_BYTE, true, STRIDE, 16)
         GLES30.glDrawArrays(mode, 0, count)
     }
 
@@ -287,23 +337,41 @@ uniform mat4 uMvp;
 uniform float uSize;
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec4 aColor;
+layout(location = 2) in vec3 aNormal;
 out vec4 vColor;
+out vec3 vNormal;
+out vec3 vPos;
 void main() {
     gl_Position = uMvp * vec4(aPos, 1.0);
-    gl_PointSize = clamp(uSize / gl_Position.w, 1.5, 24.0);
+    gl_PointSize = clamp(uSize / gl_Position.w, 1.5, 32.0);
     vColor = aColor;
+    vNormal = aNormal;
+    vPos = aPos;
 }"""
         const val FS = """#version 300 es
 precision mediump float;
 uniform float uPoints;
+uniform vec3 uEye;
 in vec4 vColor;
+in vec3 vNormal;
+in vec3 vPos;
 out vec4 frag;
 void main() {
     if (uPoints < 0.5) { frag = vColor; return; }  // lines
     vec2 d = gl_PointCoord - vec2(0.5);
     float r2 = dot(d, d);
     if (r2 > 0.25) discard;
-    frag = vec4(vColor.rgb * (1.0 - 0.6 * r2), 1.0);  // slight sphere-like shading
+    if (dot(vNormal, vNormal) < 0.25) {  // no normal (sparse points): sphere-like shading
+        frag = vec4(vColor.rgb * (1.0 - 0.6 * r2), 1.0);
+        return;
+    }
+    // Surface normal, turned towards the viewer; key light from above plus sky/ground ambient.
+    vec3 n = normalize(vNormal);
+    if (dot(n, uEye - vPos) < 0.0) n = -n;
+    vec3 l = normalize(vec3(0.35, -0.3, 0.88));
+    float hemi = 0.5 + 0.5 * n.z;
+    float diff = max(dot(n, l), 0.0);
+    frag = vec4(vColor.rgb * (0.45 + 0.2 * hemi + 0.45 * diff) * (1.0 - 0.25 * r2), 1.0);
 }"""
     }
 }

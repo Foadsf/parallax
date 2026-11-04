@@ -127,13 +127,15 @@ public:
                 }
                 s_.tracks[id].elements.push_back({int(i), k});
             }
-        // A track may not see the same image twice; keep the first feature per image.
+        // A track may not see the same image twice. When transitive matches put two keypoints
+        // of one image in a component, which one is right is unknown: drop that image from it.
         for (size_t id = 0; id < s_.tracks.size(); ++id) {
             auto& el = s_.tracks[id].elements;
-            std::set<int> seen;
+            std::map<int, int> perImage;
+            for (const auto& e : el) perImage[e.image]++;
             std::vector<Observation> kept;
             for (const auto& e : el)
-                if (seen.insert(e.image).second) kept.push_back(e);
+                if (perImage[e.image] == 1) kept.push_back(e);
             el.swap(kept);
             if (el.size() < 2) { el.clear(); continue; }
             for (const auto& e : el) s_.images[e.image].track[e.keypoint] = int(id);
@@ -382,11 +384,37 @@ private:
         return true;
     }
 
+    // Track completion (as in COLMAP): once poses improve, observations rejected at
+    // registration time may now fit; attach every registered observation of each track that
+    // reprojects within the threshold.
+    void completeTracks() {
+        for (auto& p : s_.points) {
+            if (!p.valid || p.track < 0) continue;
+            std::set<int> have;
+            for (const auto& o : p.obs) have.insert(o.image);
+            for (const auto& e : s_.tracks[p.track].elements)
+                if (s_.images[e.image].registered && !have.count(e.image) && reprojectionError(s_, p, e) < s_.opt.maxReprojError) {
+                    p.obs.push_back(e);
+                    have.insert(e.image);
+                }
+        }
+    }
+
     double globalBA(bool intrinsics, int iterations) {
+        completeTracks();
         BAOptions o;
         for (size_t i = 0; i < s_.images.size(); ++i)
             if (s_.images[i].registered) o.variableImages.push_back(int(i));
         o.fixedGaugeImage = order_.empty() ? -1 : order_[0];
+        // The seventh gauge freedom (scale): hold the largest translation component of the
+        // second initial image (COLMAP fixes the same freedom).
+        if (order_.size() > 1 && s_.images[order_[1]].registered) {
+            const cv::Vec3d& t = s_.images[order_[1]].t;
+            int axis = 0;
+            for (int k = 1; k < 3; ++k) if (std::abs(t[k]) > std::abs(t[axis])) axis = k;
+            o.scaleGaugeImage = order_[1];
+            o.scaleGaugeAxis = axis;
+        }
         o.refineIntrinsics = intrinsics;
         o.maxIterations = iterations;
         const double r = bundleAdjust(s_, o);
@@ -513,28 +541,70 @@ cv::Matx33d rotationBetween(cv::Vec3d a, cv::Vec3d b) {
 }
 
 void colourSparsePoints(State& s) {
-    std::vector<cv::Vec3d> sum(s.points.size(), cv::Vec3d(0, 0, 0));
-    std::vector<int> cnt(s.points.size(), 0);
-    std::vector<std::vector<std::pair<int, int>>> perImage(s.images.size());
-    for (size_t j = 0; j < s.points.size(); ++j)
-        if (s.points[j].valid)
-            for (const auto& o : s.points[j].obs) perImage[o.image].emplace_back(int(j), o.keypoint);
-    for (size_t i = 0; i < s.images.size(); ++i) {
-        if (perImage[i].empty()) continue;
-        cv::Mat bgr = cv::imread(s.images[i].input.path, cv::IMREAD_COLOR);
-        if (bgr.empty()) continue;
-        for (const auto& pk : perImage[i]) {
-            const cv::Point2f& px = s.images[i].pixels[pk.second];
-            const int x = std::clamp(int(px.x + 0.5f), 0, bgr.cols - 1), y = std::clamp(int(px.y + 0.5f), 0, bgr.rows - 1);
-            const cv::Vec3b c = bgr.at<cv::Vec3b>(y, x);
-            sum[pk.first] += cv::Vec3d(c[2], c[1], c[0]);
-            cnt[pk.first]++;
+    for (auto& p : s.points) {
+        if (!p.valid || p.obs.empty()) continue;
+        cv::Vec3d sum(0, 0, 0);
+        for (const auto& o : p.obs) {
+            const cv::Vec3b& c = s.images[o.image].colors[o.keypoint];
+            sum += cv::Vec3d(c[0], c[1], c[2]);
         }
+        sum *= 1.0 / double(p.obs.size());
+        p.color = cv::Vec3b(cv::saturate_cast<uchar>(sum[0]), cv::saturate_cast<uchar>(sum[1]), cv::saturate_cast<uchar>(sum[2]));
     }
-    for (size_t j = 0; j < s.points.size(); ++j)
-        if (cnt[j]) s.points[j].color = cv::Vec3b(cv::saturate_cast<uchar>(sum[j][0] / cnt[j]),
-                                                  cv::saturate_cast<uchar>(sum[j][1] / cnt[j]),
-                                                  cv::saturate_cast<uchar>(sum[j][2] / cnt[j]));
+}
+
+// Metric scale from printed ArUco markers of known edge length: triangulate each marker
+// corner from every registered view that saw it (DLT on undistorted coordinates), then
+// compare the median reconstructed edge with the true edge.
+double estimateMarkerScale(const State& s, std::string& log) {
+    if (s.opt.markerSizeMm <= 0) return 0;
+    std::map<int, std::vector<int>> seenBy;  // marker id -> images
+    for (size_t i = 0; i < s.images.size(); ++i)
+        if (s.images[i].registered)
+            for (const auto& m : s.images[i].markers) seenBy[m.first].push_back(int(i));
+    std::vector<double> edges;
+    int used = 0;
+    for (const auto& kv : seenBy) {
+        if (kv.second.size() < 3) continue;
+        std::array<cv::Vec3d, 4> X;
+        bool ok = true;
+        for (int c = 0; c < 4 && ok; ++c) {
+            cv::Mat A(int(kv.second.size()) * 2, 4, CV_64F);
+            int row = 0;
+            double maxAngle = 0;
+            for (int i : kv.second) {
+                const Image& im = s.images[i];
+                std::vector<cv::Point2d> n;
+                undistortKeypoints(s.cameras[im.camera], {im.markers.at(kv.first)[c]}, n);
+                for (int k = 0; k < 4; ++k) {
+                    const double p0 = k < 3 ? im.R(0, k) : im.t[0], p1 = k < 3 ? im.R(1, k) : im.t[1],
+                                 p2 = k < 3 ? im.R(2, k) : im.t[2];
+                    A.at<double>(row, k) = n[0].x * p2 - p0;
+                    A.at<double>(row + 1, k) = n[0].y * p2 - p1;
+                }
+                row += 2;
+            }
+            cv::Mat w, u, vt;
+            cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A);
+            const double h = vt.at<double>(3, 3);
+            if (std::abs(h) < 1e-12) { ok = false; break; }
+            X[c] = {vt.at<double>(3, 0) / h, vt.at<double>(3, 1) / h, vt.at<double>(3, 2) / h};
+            for (size_t a = 0; a < kv.second.size(); ++a)
+                for (size_t b = a + 1; b < kv.second.size(); ++b)
+                    maxAngle = std::max(maxAngle, triangulationAngleDeg(X[c], s.images[kv.second[a]].centre(),
+                                                                        s.images[kv.second[b]].centre()));
+            if (maxAngle < 3.0) ok = false;
+        }
+        if (!ok) continue;
+        for (int c = 0; c < 4; ++c) edges.push_back(cv::norm(X[c] - X[(c + 1) % 4]));
+        ++used;
+    }
+    std::ostringstream ss;
+    ss << "markers used for scale: " << used << "\n";
+    log += ss.str();
+    if (edges.empty()) return 0;
+    std::nth_element(edges.begin(), edges.begin() + edges.size() / 2, edges.end());
+    return s.opt.markerSizeMm * 1e-3 / edges[edges.size() / 2];
 }
 
 }  // namespace
@@ -544,6 +614,7 @@ Result Reconstructor::run(const std::string& outputDir, const std::string& image
     State s;
     s.opt = opt_;
     s.cameras = cameras_;
+    s.priors = cameras_;
     std::unordered_map<int, int> camIndex;
     for (size_t c = 0; c < s.cameras.size(); ++c) camIndex[s.cameras[c].id] = int(c);
     for (const auto& in : images_) {
@@ -571,7 +642,17 @@ Result Reconstructor::run(const std::string& outputDir, const std::string& image
         log = pipe.log();
 
         // Frame: metric scale, gravity-up (+Z), origin at the median of the sparse points.
-        double scale = estimateMetricScale(s, log);
+        // A printed marker of known size is a direct measurement; the rig baseline comes from
+        // factory metadata. Prefer the marker when both exist.
+        const double rigScale = estimateMetricScale(s, log);
+        const double markerScale = estimateMarkerScale(s, log);
+        double scale = markerScale > 0 ? markerScale : rigScale;
+        res.scaleSource = markerScale > 0 ? "marker" : (rigScale > 0 ? "rig" : "none");
+        if (markerScale > 0 && rigScale > 0) {
+            std::ostringstream ss;
+            ss << "rig scale differs from marker scale by " << 100.0 * (rigScale / markerScale - 1.0) << " %\n";
+            log += ss.str();
+        }
         res.metresPerUnit = scale;
         if (scale <= 0) {
             // Unknown scale: normalise so the median camera-to-centre distance is one unit.
@@ -667,6 +748,7 @@ std::string resultToJson(const Result& r) {
        << ",\"imagesTotal\":" << r.imagesTotal << ",\"imagesRegistered\":" << r.imagesRegistered
        << ",\"sparsePoints\":" << r.sparsePoints << ",\"densePoints\":" << r.densePoints
        << ",\"meanReprojError\":" << r.meanReprojError << ",\"metresPerUnit\":" << r.metresPerUnit
+       << ",\"scaleSource\":\"" << r.scaleSource << "\""
        << ",\"gravityAligned\":" << (r.gravityAligned ? "true" : "false") << ",\"cameraCentres\":[";
     for (size_t i = 0; i < r.cameraCentres.size(); ++i) ss << (i ? "," : "") << r.cameraCentres[i];
     ss << "]}";

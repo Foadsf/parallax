@@ -5,6 +5,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/flann.hpp>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -26,6 +27,8 @@ struct Image {
     cv::Mat descriptors;                  // RootSIFT, CV_32F
     std::shared_ptr<cv::flann::Index> index;  // kd-trees over descriptors, built once
     std::vector<int> track;               // per keypoint: track id or -1
+    std::vector<cv::Vec3b> colors;        // per keypoint RGB, sampled at extraction
+    std::map<int, std::array<cv::Point2f, 4>> markers;  // ArUco id -> corners, full-resolution pixels
     bool registered = false;
     cv::Matx33d R = cv::Matx33d::eye();   // world -> camera
     cv::Vec3d t = {0, 0, 0};
@@ -64,6 +67,7 @@ struct PairGeometry {
 struct State {
     Options opt;
     std::vector<CameraModel> cameras;
+    std::vector<CameraModel> priors;   // intrinsics as supplied, for the calibration prior
     std::vector<Image> images;
     std::vector<PairGeometry> pairs;
     std::vector<Track> tracks;
@@ -100,6 +104,8 @@ double triangulationAngleDeg(const cv::Vec3d& X, const cv::Vec3d& c1, const cv::
 struct BAOptions {
     std::vector<int> variableImages;  // poses optimised; others observing the points stay fixed
     int fixedGaugeImage = -1;         // never moved
+    // Scale gauge: one translation component of a second image is held fixed (global BA only).
+    int scaleGaugeImage = -1, scaleGaugeAxis = 0;
     bool refineIntrinsics = false;
     int maxIterations = 15;
     double huberPx = 2.0;

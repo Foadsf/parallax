@@ -28,7 +28,9 @@ struct TrackResult {
     float meanY = 0, darkRatio = 0, clipRatio = 0;
     int tracked = 0;
     bool keyframe = false;  // suggestion; the caller decides and calls markKeyframe()
-    std::vector<cv::Point2f> points;  // normalised [0,1] in the sensor frame
+    bool sharp = true;      // passed the blur gate
+    std::vector<cv::Point2f> points;   // normalised [0,1] in the sensor frame
+    std::vector<cv::Point2f> anchors;  // the same points at the last keyframe (flow trails)
 };
 
 class Tracker {

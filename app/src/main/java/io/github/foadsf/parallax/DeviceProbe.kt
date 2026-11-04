@@ -17,7 +17,7 @@ import kotlin.math.roundToInt
 data class Processing(
     val name: String, val featureMaxSide: Int, val maxFeatures: Int, val denseMaxSide: Int, val maxDenseImages: Int,
 ) {
-    fun asOptions() = intArrayOf(1, featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages)
+    fun asOptions(markerSizeMm: Int = 0) = intArrayOf(1, featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages, markerSizeMm)
 }
 
 /** What the app found out about the phone, in report order. */

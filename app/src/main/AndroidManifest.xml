@@ -3,6 +3,10 @@
 
     <!-- Camera only. No network permission: scans never leave the phone unless you share them. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Reconstruction runs as a foreground service with a progress notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
@@ -27,6 +31,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Minutes of on-device photogrammetry the user started; no other FGS type fits
+             (it is not dataSync: nothing is transferred). -->
+        <service
+            android:name=".ReconstructionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device 3D reconstruction (photogrammetry) of a scan the user just captured" />
+        </service>
 
         <!-- Vendor OpenCL is reachable from apps only when the ROM lists it in public.libraries.txt
              and the app asks for it (targetSdk >= 31). Optional: the app runs without it. -->

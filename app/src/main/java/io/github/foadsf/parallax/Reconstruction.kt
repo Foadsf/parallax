@@ -4,8 +4,11 @@ import org.json.JSONObject
 import java.io.File
 
 object Reconstruction {
-    /** Runs the native pipeline on [scan] (blocking). Returns the report, or an error message. */
-    fun run(scan: Scan, processing: Processing, progress: NativeCore.Progress): Result<JSONObject> {
+    /**
+     * Runs the native pipeline on [scan] (blocking). [markerSizeMm] is the edge of a printed ArUco
+     * scale marker in the scene (0 = none). Returns the report, or an error message.
+     */
+    fun run(scan: Scan, processing: Processing, markerSizeMm: Int, progress: NativeCore.Progress): Result<JSONObject> {
         val loaded = scan.load() ?: return Result.failure(IllegalStateException("scan.json is missing or damaged"))
         val cams = loaded.cameras
         val imgs = loaded.images.filter { File(scan.imagesDir, it.file).exists() }
@@ -30,7 +33,7 @@ object Reconstruction {
                 g?.get(1)?.toDouble() ?: 0.0, g?.get(2)?.toDouble() ?: 0.0, if (g != null) 1.0 else 0.0,
             ).copyInto(motion, k * 6)
         }
-        val options = processing.asOptions()
+        val options = processing.asOptions(markerSizeMm)
         val json = NativeCore.reconstruct(
             camArr, flags,
             imgs.map { File(scan.imagesDir, it.file).absolutePath }.toTypedArray(),

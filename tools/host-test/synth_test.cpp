@@ -19,6 +19,11 @@
 
 #include "core.hpp"
 
+#if __has_include(<opencv2/objdetect/aruco_detector.hpp>)
+#include <opencv2/objdetect/aruco_detector.hpp>
+#define SYNTH_HAVE_ARUCO 1
+#endif
+
 namespace fs = std::filesystem;
 using namespace parallax;
 
@@ -56,6 +61,22 @@ cv::Vec3d texture(const cv::Vec3d& X, uint32_t material) {
         c[ch] = a;
     }
     return c;
+}
+
+// ---- Optional printed scale marker on the ground ------------------------------------------
+// ArUco DICT_4X4_50 id 7, 60 mm black square centred at (0.20, -0.20), with a one-cell white
+// quiet zone (8 x 8 cells of 10 mm).
+cv::Mat gMarker;  // 8 x 8 cells, 0 = black, 255 = white; empty when off
+const cv::Vec2d kMarkerCentre(0.20, -0.20);
+constexpr double kMarkerSize = 0.060;
+
+bool markerColour(const cv::Vec3d& X, double& value) {
+    if (gMarker.empty()) return false;
+    const double cell = kMarkerSize / 6.0;
+    const double u = (X[0] - kMarkerCentre[0]) / cell + 4.0, v = (kMarkerCentre[1] - X[1]) / cell + 4.0;
+    if (u < 0 || v < 0 || u >= 8 || v >= 8) return false;
+    value = gMarker.at<uchar>(int(v), int(u)) > 127 ? 0.95 : 0.05;
+    return true;
 }
 
 // ---- Scene: ground plane z = 0, a box and a sphere ----------------------------------------
@@ -140,7 +161,9 @@ cv::Mat render(const CameraModel& m, const std::function<Pose(int row)>& poseAtR
                 if (intersect(C, d, th, n, mat)) {
                     const cv::Vec3d X = C + th * d;
                     const double shade = 0.45 + 0.55 * std::max(0.0, n.dot(light));
-                    col = 255.0 * shade * texture(X, mat);
+                    double mv;
+                    if (mat == 1 && markerColour(X, mv)) col = 255.0 * shade * cv::Vec3d(mv, mv, mv);
+                    else col = 255.0 * shade * texture(X, mat);
                 }
                 img.at<cv::Vec3b>(y, x) = cv::Vec3b(cv::saturate_cast<uchar>(col[2]), cv::saturate_cast<uchar>(col[1]),
                                                     cv::saturate_cast<uchar>(col[0]));
@@ -235,12 +258,13 @@ int main(int argc, char** argv) {
     }
     const fs::path work = argv[1];
     int views = 36;
-    bool rig = true, dense = true, rs = false, rsModel = true;
+    bool rig = true, dense = true, rs = false, rsModel = true, marker = false;
     for (int a = 2; a < argc; ++a) {
         if (!std::strcmp(argv[a], "--single")) rig = false;
         else if (!std::strcmp(argv[a], "--no-dense")) dense = false;
         else if (!std::strcmp(argv[a], "--rs")) rs = true;  // rolling-shutter images, hand-held sway
         else if (!std::strcmp(argv[a], "--no-rs-model")) rsModel = false;
+        else if (!std::strcmp(argv[a], "--marker")) marker = true;  // printed 60 mm ArUco on the ground
         else views = std::atoi(argv[a]);
     }
     fs::create_directories(work / "images");
@@ -266,6 +290,18 @@ int main(int argc, char** argv) {
     Options opt;
     opt.dense = dense;
     opt.rollingShutter = rsModel;
+    if (marker) {
+#ifdef SYNTH_HAVE_ARUCO
+        cv::Mat m;
+        cv::aruco::generateImageMarker(cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50), 7, 6, m, 1);
+        gMarker = cv::Mat(8, 8, CV_8U, cv::Scalar(255));
+        m.copyTo(gMarker(cv::Rect(1, 1, 6, 6)));
+        opt.markerSizeMm = kMarkerSize * 1000;
+#else
+        std::fprintf(stderr, "--marker needs OpenCV with objdetect/ArUco\n");
+        return 2;
+#endif
+    }
     const double skew = rs ? 0.030 : 0.0;  // 30 ms readout, typical of phone sensors
     Reconstructor rec(opt);
     rec.addCamera(wideGuess);
@@ -277,7 +313,7 @@ int main(int argc, char** argv) {
         const double tv = v * kSecondsPerView;  // capture time of the middle row
         const Pose mid = trajectory(tv, views, rs);
         auto rowTime = [&](int row, const CameraModel& m) { return tv + skew * (double(row) / (m.height - 1) - 0.5); };
-        const char* tag = rs ? "_rs" : "";
+        const char* tag = rs ? (marker ? "_rs_m" : "_rs") : (marker ? "_m" : "");
         char name[64];
         std::snprintf(name, sizeof name, "w_%03d_of_%03d%s.jpg", v, views, tag);  // cached renders must match
         const std::string pw = (work / "images" / name).string();
@@ -351,6 +387,13 @@ int main(int argc, char** argv) {
                 r.imagesTotal, rmsPos * 1000, s, upErrDeg);
 
     bool pass = r.imagesRegistered >= int(0.9 * r.imagesTotal) && rmsPos < 0.005 && upErrDeg < 2.0;
+    if (marker) {
+        // Single camera, so the scale can only come from the marker: exported units are metres.
+        const bool ok = r.scaleSource == "marker" && std::abs(s - 1.0) < 0.01;
+        std::printf("marker scale %s (source %s, alignment scale %.4f should be 1)\n", ok ? "OK" : "FAIL",
+                    r.scaleSource.c_str(), s);
+        pass = pass && ok;
+    }
     if (rs) {
         // Uncorrected (--no-rs-model) this scene gives about 1.7 mm and must fail; corrected, it
         // reaches the global-shutter level (~0.4 mm).

@@ -201,6 +201,9 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
 
     std::unordered_map<uint64_t, int> index;
     std::vector<Voxel> voxels;
+    // Voxel size: about 1.5 dense pixels at the median depth of the first reference depth map,
+    // then fixed for the whole scene. (The median distance to the sparse points is not a good
+    // substitute: background features put it about twice as far as the surface being matched.)
     double voxel = 0;
 
     for (size_t r = 0; r < refs.size(); ++r) {
@@ -293,7 +296,7 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
                 for (int x = 0; x < depth.cols; x += 4)
                     if (depth.at<float>(y, x) > 0) z.push_back(depth.at<float>(y, x));
             if (z.empty()) continue;
-            voxel = 1.5 * percentile(z, 0.5) / rv.K(0, 0);  // about 1.5 dense pixels at the median depth
+            voxel = 1.5 * percentile(z, 0.5) / rv.K(0, 0);
         }
 
         const double fx = rv.K(0, 0), fy = rv.K(1, 1), ux = rv.K(0, 2), uy = rv.K(1, 2);
@@ -306,6 +309,11 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
             for (int x = 1; x + 1 < depth.cols; ++x) {
                 if (depth.at<float>(y, x) <= 0 || depth.at<float>(y, x - 1) <= 0 || depth.at<float>(y, x + 1) <= 0 ||
                     depth.at<float>(y - 1, x) <= 0 || depth.at<float>(y + 1, x) <= 0)
+                    continue;
+                // No normals across depth discontinuities (silhouettes): they would be grazing.
+                const float zc = depth.at<float>(y, x);
+                if (std::abs(depth.at<float>(y, x + 1) - depth.at<float>(y, x - 1)) > 0.05f * zc ||
+                    std::abs(depth.at<float>(y + 1, x) - depth.at<float>(y - 1, x)) > 0.05f * zc)
                     continue;
                 const cv::Vec3d P = backproject(x, y);
                 cv::Vec3d nrm = (backproject(x + 1, y) - backproject(x - 1, y)).cross(backproject(x, y + 1) - backproject(x, y - 1));

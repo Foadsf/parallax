@@ -13,7 +13,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-enum class Glyph { Torch, TorchOff, TorchAuto, Stack, Back, Share, Download, Trash, Cube, Info, Copy }
+enum class Glyph { Torch, TorchOff, TorchAuto, Stack, Back, Share, Download, Trash, Cube, Info, Copy, More, Points, Frustum, Recenter, Ruler }
 
 /** Line icons drawn on a 24-unit grid, so the app needs no icon library. */
 @Composable
@@ -64,6 +64,28 @@ fun GlyphIcon(g: Glyph, tint: Color, size: Dp = 24.dp, modifier: Modifier = Modi
                 drawRoundRect(tint, topLeft = p(8f, 8f), size = androidx.compose.ui.geometry.Size(12f * u, 13f * u),
                     cornerRadius = androidx.compose.ui.geometry.CornerRadius(2f * u), style = stroke)
                 drawPath(path(16f to 5f, 16f to 3.5f, 4f to 3.5f, 4f to 16f, 5.5f to 16f), tint, style = stroke)
+            }
+            Glyph.More -> for (y in floatArrayOf(5f, 12f, 19f)) drawCircle(tint, 1.7f * u, p(12f, y))
+            Glyph.Points -> {
+                drawCircle(tint, 1.2f * u, p(6f, 17f))
+                drawCircle(tint, 2.0f * u, p(12f, 9f))
+                drawCircle(tint, 3.0f * u, p(17.5f, 16f))
+            }
+            Glyph.Frustum -> {
+                // A camera pyramid seen from the side: apex at the lens, image plane on the right.
+                drawPath(path(15f to 4f, 21f to 7f, 21f to 17f, 15f to 20f, close = true), tint, style = stroke)
+                drawPath(path(15f to 4f, 3f to 12f, 15f to 20f), tint, style = stroke)
+                drawLine(tint, p(3f, 12f), p(21f, 12f), stroke.width * 0.7f, StrokeCap.Round)
+            }
+            Glyph.Recenter -> {
+                drawCircle(tint, 6.5f * u, p(12f, 12f), style = stroke)
+                drawCircle(tint, 1.8f * u, p(12f, 12f))
+                for ((a, b) in listOf(p(12f, 2f) to p(12f, 5f), p(12f, 19f) to p(12f, 22f), p(2f, 12f) to p(5f, 12f), p(19f, 12f) to p(22f, 12f)))
+                    drawLine(tint, a, b, stroke.width, StrokeCap.Round)
+            }
+            Glyph.Ruler -> {
+                drawPath(path(2.5f to 15f, 15f to 2.5f, 21.5f to 9f, 9f to 21.5f, close = true), tint, style = stroke)
+                for ((x, y) in listOf(6f to 11.5f, 9f to 8.5f, 12f to 5.5f)) drawLine(tint, p(x, y), p(x + 2.5f, y + 2.5f), stroke.width, StrokeCap.Round)
             }
             Glyph.Cube -> {
                 drawPath(path(12f to 2.5f, 20.5f to 7f, 20.5f to 17f, 12f to 21.5f, 3.5f to 17f, 3.5f to 7f, close = true), tint, style = stroke)

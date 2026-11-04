@@ -123,6 +123,7 @@ TrackResult Tracker::process(const YuvFrame& f) {
     res.sharpness = float(sd[0] * sd[0]);
     sharpRef_ = sharpRef_ == 0 ? res.sharpness : std::max(0.98f * sharpRef_, res.sharpness);
     const bool sharp = res.sharpness >= 0.55f * sharpRef_;
+    res.sharp = sharp;
 
     // Pyramidal Lucas-Kanade with a forward-backward consistency check (Kalal et al. 2010).
     if (!prev_.empty() && !pts_.empty()) {
@@ -172,7 +173,11 @@ TrackResult Tracker::process(const YuvFrame& f) {
     }
     prev_ = gray;
     res.points.reserve(pts_.size());
-    for (const auto& p : pts_) res.points.emplace_back(p.x / gray.cols, p.y / gray.rows);
+    res.anchors.reserve(pts_.size());
+    for (size_t i = 0; i < pts_.size(); ++i) {
+        res.points.emplace_back(pts_[i].x / gray.cols, pts_[i].y / gray.rows);
+        res.anchors.emplace_back(anchors_[i].x / gray.cols, anchors_[i].y / gray.rows);
+    }
     return res;
 }
 

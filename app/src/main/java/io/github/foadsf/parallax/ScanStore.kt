@@ -42,6 +42,21 @@ class Scan(val dir: File) {
 
     fun imageCount(): Int = imagesDir.list()?.count { it.endsWith(".jpg") } ?: 0
 
+    /** The user's name for the scan (scan.json "title"), or the folder's timestamp. */
+    val title: String
+        get() = runCatching { JSONObject(meta.readText()).optString("title") }.getOrNull()?.takeIf { it.isNotBlank() } ?: name
+
+    fun rename(title: String) {
+        val o = JSONObject(meta.readText())
+        if (title.isBlank()) o.remove("title") else o.put("title", title.trim())
+        val tmp = File(dir, "scan.json.tmp")
+        tmp.writeText(o.toString(1))
+        tmp.renameTo(meta)
+    }
+
+    /** Bytes on disk (images, clouds, model). */
+    fun sizeBytes(): Long = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
     fun write(cameras: List<ScanCamera>, images: List<ScanImage>) {
         val o = JSONObject()
         o.put("format", 1)

@@ -1,5 +1,6 @@
 // Parallax: JNI bridge for io.github.foadsf.parallax.NativeCore.
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <algorithm>
 #include <android/bitmap.h>
 #include <android/log.h>
 #include <jni.h>
@@ -64,8 +65,8 @@ JNIEXPORT void JNICALL Java_io_github_foadsf_parallax_NativeCore_trackerMarkKeyf
     gTracker.markKeyframe();
 }
 
-// out: [progress, sharpness, meanY, darkRatio, clipRatio, keyframe(0/1), tracked]
-// pts: x0, y0, x1, y1, ... normalised, in the sensor frame. Returns the number of points.
+// out: [progress, sharpness, meanY, darkRatio, clipRatio, keyframe(0/1), tracked, sharp(0/1)]
+// pts: x, y, anchorX, anchorY per point, normalised, in the sensor frame. Returns the number of points.
 JNIEXPORT jint JNICALL Java_io_github_foadsf_parallax_NativeCore_trackFrame(
     JNIEnv* env, jobject, jobject y, jobject u, jobject v, jint w, jint h, jint ys, jint uvs, jint uvp, jobject preview,
     jint rotation, jboolean track, jfloatArray out, jfloatArray pts) {
@@ -83,12 +84,17 @@ JNIEXPORT jint JNICALL Java_io_github_foadsf_parallax_NativeCore_trackFrame(
     }
     if (!track) return 0;
     const TrackResult r = gTracker.process(f);
-    const jfloat o[7] = {r.progress, r.sharpness, r.meanY, r.darkRatio, r.clipRatio, r.keyframe ? 1.f : 0.f,
-                         float(r.tracked)};
-    env->SetFloatArrayRegion(out, 0, 7, o);
-    const int cap = env->GetArrayLength(pts) / 2;
+    const jfloat o[8] = {r.progress, r.sharpness, r.meanY, r.darkRatio, r.clipRatio, r.keyframe ? 1.f : 0.f,
+                         float(r.tracked), r.sharp ? 1.f : 0.f};
+    env->SetFloatArrayRegion(out, 0, std::min<jsize>(8, env->GetArrayLength(out)), o);
+    const int cap = env->GetArrayLength(pts) / 4;
     const int n = std::min(cap, int(r.points.size()));
-    if (n > 0) env->SetFloatArrayRegion(pts, 0, 2 * n, reinterpret_cast<const jfloat*>(r.points.data()));
+    std::vector<jfloat> buf(size_t(n) * 4);
+    for (int i = 0; i < n; ++i) {
+        buf[4 * i] = r.points[i].x; buf[4 * i + 1] = r.points[i].y;
+        buf[4 * i + 2] = r.anchors[i].x; buf[4 * i + 3] = r.anchors[i].y;
+    }
+    if (n > 0) env->SetFloatArrayRegion(pts, 0, 4 * n, buf.data());
     return n;
 }
 
@@ -105,19 +111,20 @@ JNIEXPORT jboolean JNICALL Java_io_github_foadsf_parallax_NativeCore_saveJpeg(JN
 // cameraFlags: per camera, bit 0 = calibrated, bit 1 = has lens position.
 // images: paths; imageCams/imageRig per image; imageUp: 3 floats per image;
 // imageMotion: 6 doubles per image: time (s), rolling-shutter skew (s), gyro x y z, has gyro.
-// options: [dense(0/1), featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages]
+// options: [dense(0/1), featureMaxSide, maxFeatures, denseMaxSide, maxDenseImages, markerSizeMm(optional)]
 JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
     JNIEnv* env, jobject, jdoubleArray cameras, jintArray cameraFlags, jobjectArray images, jintArray imageCams,
     jintArray imageRig, jfloatArray imageUp, jdoubleArray imageMotion, jstring outDir, jstring imageRoot, jintArray options, jobject progress) {
     Options opt;
     {
-        jint o[5];
-        env->GetIntArrayRegion(options, 0, 5, o);
+        jint o[6] = {1, 0, 0, 0, 0, 0};
+        env->GetIntArrayRegion(options, 0, std::min<jsize>(6, env->GetArrayLength(options)), o);
         opt.dense = o[0] != 0;
         opt.featureMaxSide = o[1];
         opt.maxFeatures = o[2];
         opt.denseMaxSide = o[3];
         opt.maxDenseImages = o[4];
+        opt.markerSizeMm = o[5];
     }
     Reconstructor rec(opt);
     const int nc = env->GetArrayLength(cameraFlags);

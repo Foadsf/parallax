@@ -5,8 +5,8 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.hardware.camera2.CameraManager
+import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.WindowManager
 import android.widget.Toast
@@ -41,12 +41,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,7 +68,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -76,6 +83,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.util.Locale
 
 private val Bg = Color(0xFF0B0D10)
 private val Panel = Color(0xFF15181D)
@@ -102,11 +110,9 @@ class MainActivity : ComponentActivity() {
     private var preview by mutableStateOf<ImageBitmap?>(null)
     private var live by mutableStateOf(LiveState())
     private var torch by mutableStateOf(TorchMode.AUTO)
-    private var stage by mutableStateOf("")
-    private var fraction by mutableStateOf(0f)
-    private var startedAt = 0L
-    @Volatile private var cancel = false
     private var controller: CaptureController? = null
+
+    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         hasCamera = ok
@@ -122,13 +128,29 @@ class MainActivity : ComponentActivity() {
             .getOrDefault(emptyList())
         hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         if (!hasCamera) permission.launch(Manifest.permission.CAMERA)
+        // Reopened while a reconstruction runs in the background: show its progress.
+        (ReconstructionService.state.value as? Job.Running)?.let { screen = Screen.Processing(it.scan) }
         setContent {
+            val job by ReconstructionService.state.collectAsState()
+            LaunchedEffect(job, screen) {
+                val j = job
+                if (screen !is Screen.Processing) return@LaunchedEffect
+                when (j) {
+                    is Job.Done -> { ReconstructionService.acknowledge(); go(Screen.Viewer(j.scan)) }
+                    is Job.Failed -> {
+                        ReconstructionService.acknowledge()
+                        Toast.makeText(this@MainActivity, j.message, Toast.LENGTH_LONG).show()
+                        go(Screen.Scans)
+                    }
+                    else -> {}
+                }
+            }
             MaterialTheme(colorScheme = darkColorScheme(background = Bg, surface = Panel, primary = Accent)) {
                 Box(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
                     when (val s = screen) {
                         Screen.Capture -> CaptureScreen()
                         Screen.Scans -> ScansScreen()
-                        is Screen.Processing -> ProcessingScreen(s.scan)
+                        is Screen.Processing -> ProcessingScreen(s.scan, job)
                         is Screen.Viewer -> ViewerScreen(s.scan)
                         Screen.Device -> DeviceScreen()
                     }
@@ -169,24 +191,20 @@ class MainActivity : ComponentActivity() {
         if (s == Screen.Capture) { screen = s; openCamera() } else { closeCamera(); screen = s }
     }
 
+    /** Reconstructs in a foreground service, so leaving the app or locking the phone is fine. */
     private fun process(scan: Scan) {
-        go(Screen.Processing(scan))
-        cancel = false
-        stage = "Starting"
-        fraction = 0f
-        startedAt = SystemClock.elapsedRealtime()
-        lifecycleScope.launch {
-            val result = withContext(Dispatchers.Default) {
-                Reconstruction.run(scan, DeviceProbe.processing(this@MainActivity)) { st, f ->
-                    runOnUiThread { stage = st; fraction = f }
-                    !cancel
-                }
-            }
-            result.onSuccess { go(Screen.Viewer(scan)) }.onFailure {
-                Toast.makeText(this@MainActivity, it.message?.lineSequence()?.firstOrNull() ?: "Failed", Toast.LENGTH_LONG).show()
-                go(Screen.Scans)
-            }
+        val running = ReconstructionService.state.value as? Job.Running
+        if (running != null && running.scan.dir != scan.dir) {
+            Toast.makeText(this, "Already reconstructing ${running.scan.title}", Toast.LENGTH_LONG).show()
+            go(Screen.Processing(running.scan))
+            return
         }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notifications.launch(Manifest.permission.POST_NOTIFICATIONS)  // progress notification; optional
+        }
+        ReconstructionService.start(this, scan)
+        go(Screen.Processing(scan))
     }
 
     // ---- Capture ----------------------------------------------------------------------------
@@ -232,9 +250,17 @@ class MainActivity : ComponentActivity() {
                     if (img != null) Image(img, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
                     val pts = live.points
                     Canvas(Modifier.fillMaxSize()) {
+                        // Each point with its trail back to where it was at the last keyframe: long
+                        // trails mean enough parallax for the next keyframe.
                         val r = 2.2.dp.toPx()
+                        val w = 1.2.dp.toPx()
                         val c = if (live.scanning) Accent else Color.White.copy(alpha = 0.55f)
-                        for (k in 0 until pts.size / 2) drawCircle(c, r, Offset(pts[2 * k] * size.width, pts[2 * k + 1] * size.height))
+                        val trail = c.copy(alpha = 0.45f)
+                        for (k in 0 until pts.size / 4) {
+                            val at = Offset(pts[4 * k] * size.width, pts[4 * k + 1] * size.height)
+                            if (live.scanning) drawLine(trail, Offset(pts[4 * k + 2] * size.width, pts[4 * k + 3] * size.height), at, w, StrokeCap.Round)
+                            drawCircle(c, r, at)
+                        }
                     }
                     if (live.scanning) {
                         CoverageDial(live.coverage, live.heading,
@@ -246,7 +272,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
             Text(live.hint.ifEmpty { if (live.scanning) " " else "Frame the object, then tap to scan" },
-                color = if (live.hint == "Too dark" || live.hint == "Slow down") Warn else Muted,
+                color = if (live.hint.startsWith("Too dark") || live.hint.startsWith("Slow down") || live.hint.startsWith("Hold steady") ||
+                    live.hint.startsWith("Glare")) Warn else Muted,
                 fontSize = 14.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp))
             // Bottom: scans, shutter, spacer.
             Row(Modifier.fillMaxWidth().padding(start = 28.dp, end = 28.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically,
@@ -316,8 +343,12 @@ class MainActivity : ComponentActivity() {
     // ---- Processing -------------------------------------------------------------------------
 
     @Composable
-    private fun ProcessingScreen(scan: Scan) {
-        BackHandler { cancel = true }
+    private fun ProcessingScreen(scan: Scan, job: Job) {
+        val running = job as? Job.Running
+        val fraction = running?.fraction ?: 0f
+        val stage = running?.stage ?: "Starting"
+        val cancelling = running?.cancelling == true
+        BackHandler { go(Screen.Scans) }
         Column(Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center) {
             val p by animateFloatAsState(fraction, label = "fraction")
@@ -333,9 +364,11 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(28.dp))
             Text(stage, color = Ink, fontSize = 18.sp)
             Spacer(Modifier.height(6.dp))
-            Text("${scan.imageCount()} images · keep the app open", color = Muted, fontSize = 13.sp)
+            Text("${scan.title} · ${scan.imageCount()} images", color = Muted, fontSize = 13.sp)
+            Spacer(Modifier.height(4.dp))
+            Text("Runs in the background; you can leave the app", color = Muted, fontSize = 12.sp)
             Spacer(Modifier.height(40.dp))
-            TextButton(onClick = { cancel = true }) { Text(if (cancel) "Cancelling…" else "Cancel", color = Muted) }
+            TextButton(onClick = { ReconstructionService.cancel() }) { Text(if (cancelling) "Cancelling…" else "Cancel", color = Muted) }
         }
     }
 
@@ -348,6 +381,9 @@ class MainActivity : ComponentActivity() {
         var view by remember { mutableStateOf<PointCloudView?>(null) }
         var dense by remember { mutableStateOf(scan.dense.length() > 300) }
         var loading by remember { mutableStateOf(true) }
+        var pointSize by remember { mutableStateOf(1) }   // index into sizes
+        var frustaOn by remember { mutableStateOf(true) }
+        val sizes = floatArrayOf(0.5f, 1f, 2f)
         LaunchedEffect(view, dense) {
             val v = view ?: return@LaunchedEffect
             loading = true
@@ -355,7 +391,7 @@ class MainActivity : ComponentActivity() {
                 val c = Cloud.readPly(if (dense) scan.dense else scan.sparse)
                 c to c?.let { Frusta.fromColmap(File(scan.dir, "sparse/0"), it.radius * 0.07f) }
             }
-            v.show(cloud, frusta)
+            v.show(cloud, frusta, metric = (report?.optDouble("metresPerUnit", 0.0) ?: 0.0) > 0)
             loading = false
         }
         Box(Modifier.fillMaxSize()) {
@@ -365,9 +401,21 @@ class MainActivity : ComponentActivity() {
                 RoundButton(onClick = { go(Screen.Scans) }) { GlyphIcon(Glyph.Back, Ink) }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(scan.name, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Text(scan.title, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(summary(report, dense), color = Muted, fontSize = 12.sp)
                 }
+            }
+            // View controls: point size, cameras, recentre.
+            Column(Modifier.align(Alignment.CenterEnd).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                RoundButton(onClick = {
+                    pointSize = (pointSize + 1) % sizes.size
+                    view?.apply { pointScale = sizes[pointSize]; requestRender() }
+                }) { GlyphIcon(Glyph.Points, Ink) }
+                RoundButton(onClick = {
+                    frustaOn = !frustaOn
+                    view?.apply { showFrusta = frustaOn; requestRender() }
+                }) { GlyphIcon(Glyph.Frustum, if (frustaOn) Accent else Muted) }
+                RoundButton(onClick = { view?.resetView() }) { GlyphIcon(Glyph.Recenter, Ink) }
             }
             if (loading) Text("Loading…", color = Muted, modifier = Modifier.align(Alignment.Center))
             Row(Modifier.align(Alignment.BottomCenter).padding(20.dp).clip(RoundedCornerShape(28.dp)).background(Panel)
@@ -392,10 +440,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun scaleLabel(r: JSONObject): String = when {
+        r.optDouble("metresPerUnit", 0.0) <= 0 -> "unscaled"
+        r.optString("scaleSource") == "marker" -> "metric (marker)"
+        else -> "metric (lens pair)"
+    }
+
     private fun summary(r: JSONObject?, dense: Boolean): String {
         if (r == null) return "Not reconstructed"
         val pts = if (dense) r.optInt("densePoints") else r.optInt("sparsePoints")
-        val scale = r.optDouble("metresPerUnit", 0.0).let { if (it > 0) "metric (m)" else "unscaled" }
+        val scale = scaleLabel(r)
         return "%,d points · %d/%d cameras · %.2f px · %s".format(pts, r.optInt("imagesRegistered"), r.optInt("imagesTotal"),
             r.optDouble("meanReprojError", 0.0), scale)
     }
@@ -413,36 +467,73 @@ class MainActivity : ComponentActivity() {
         BackHandler { go(Screen.Capture) }
         var scans by remember { mutableStateOf(ScanStore.list(this)) }
         var confirm by remember { mutableStateOf<Scan?>(null) }
+        var renaming by remember { mutableStateOf<Scan?>(null) }
+        var markerDialog by remember { mutableStateOf(false) }
         Column(Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 RoundButton(onClick = { go(Screen.Capture) }) { GlyphIcon(Glyph.Back, Ink) }
                 Spacer(Modifier.width(12.dp))
                 Text("Scans", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                RoundButton(onClick = { markerDialog = true }) { GlyphIcon(Glyph.Ruler, if (Settings.markerSizeMm(this@MainActivity) > 0) Accent else Ink) }
+                Spacer(Modifier.width(8.dp))
                 RoundButton(onClick = { go(Screen.Device) }) { GlyphIcon(Glyph.Info, Ink) }
             }
             if (scans.isEmpty()) Text("No scans yet.", color = Muted, modifier = Modifier.padding(24.dp))
             LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(scans, key = { it.name }) { s -> ScanRow(s, onDelete = { confirm = s }) }
+                items(scans, key = { it.name }) { s -> ScanRow(s, onDelete = { confirm = s }, onRename = { renaming = s }) }
             }
         }
         confirm?.let { s ->
             AlertDialog(onDismissRequest = { confirm = null },
                 title = { Text("Delete scan?") },
-                text = { Text("${s.name} and its ${s.imageCount()} images will be removed from this phone.") },
+                text = { Text("${s.title} and its ${s.imageCount()} images will be removed from this phone.") },
                 confirmButton = { TextButton({ s.dir.deleteRecursively(); scans = ScanStore.list(this); confirm = null }) { Text("Delete", color = Stop) } },
                 dismissButton = { TextButton({ confirm = null }) { Text("Keep") } })
+        }
+        renaming?.let { s ->
+            var text by remember(s) { mutableStateOf(s.title.takeIf { it != s.name } ?: "") }
+            AlertDialog(onDismissRequest = { renaming = null },
+                title = { Text("Rename scan") },
+                text = { OutlinedTextField(text, { text = it }, singleLine = true, placeholder = { Text(s.name) }) },
+                confirmButton = { TextButton({
+                    runCatching { s.rename(text) }
+                    scans = ScanStore.list(this); renaming = null
+                }) { Text("Save") } },
+                dismissButton = { TextButton({ renaming = null }) { Text("Cancel") } })
+        }
+        if (markerDialog) {
+            var text by remember { mutableStateOf(Settings.markerSizeMm(this).takeIf { it > 0 }?.toString() ?: "") }
+            AlertDialog(onDismissRequest = { markerDialog = false },
+                title = { Text("Scale marker") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Print an ArUco marker (4×4 dictionary, see the project page), put it next to the object and enter " +
+                            "its black square's edge, measured after printing. Reconstructions then use it for true scale, on any phone. " +
+                            "Leave empty to rely on the lens pair, if there is one.", fontSize = 13.sp)
+                        OutlinedTextField(text, { t -> text = t.filter { it.isDigit() }.take(4) }, singleLine = true,
+                            label = { Text("Edge (mm)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                    }
+                },
+                confirmButton = { TextButton({
+                    Settings.setMarkerSizeMm(this, text.toIntOrNull()?.coerceIn(0, 2000) ?: 0)
+                    markerDialog = false
+                }) { Text("Save") } },
+                dismissButton = { TextButton({ markerDialog = false }) { Text("Cancel") } })
         }
     }
 
     @Composable
-    private fun ScanRow(s: Scan, onDelete: () -> Unit) {
+    private fun ScanRow(s: Scan, onDelete: () -> Unit, onRename: () -> Unit) {
         val thumb = remember(s) {
             s.imagesDir.listFiles()?.filter { it.name.startsWith("p_") }?.minByOrNull { it.name }?.let { f ->
                 runCatching { BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 16 })?.asImageBitmap() }.getOrNull()
             }
         }
         val report = remember(s) { s.reportJson() }
+        val title = remember(s) { s.title }
+        val bytes by produceState(-1L, s) { value = withContext(Dispatchers.IO) { s.sizeBytes() } }
+        var menu by remember { mutableStateOf(false) }
         Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel)
             .clickable { if (report?.optBoolean("ok") == true) go(Screen.Viewer(s)) else process(s) }.padding(10.dp),
             verticalAlignment = Alignment.CenterVertically) {
@@ -451,14 +542,21 @@ class MainActivity : ComponentActivity() {
             }
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
-                Text(s.name, color = Ink, fontSize = 15.sp)
+                Text(title, color = Ink, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(if (report?.optBoolean("ok") == true) shortSummary(report) else "${s.imageCount()} images · tap to reconstruct",
                     color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (bytes >= 0) Text(megabytes(bytes) + if (title != s.name) " · ${s.name}" else "", color = Muted, fontSize = 11.sp)
             }
-            if (report?.optBoolean("ok") == true) {
-                RoundButton(onClick = { process(s) }) { GlyphIcon(Glyph.Cube, Muted, 20.dp) }
+            Box {
+                RoundButton(onClick = { menu = true }) { GlyphIcon(Glyph.More, Muted, 20.dp) }
+                DropdownMenu(menu, { menu = false }) {
+                    DropdownMenuItem({ Text("Rename") }, { menu = false; onRename() })
+                    DropdownMenuItem({ Text(if (report?.optBoolean("ok") == true) "Reconstruct again" else "Reconstruct") },
+                        { menu = false; process(s) })
+                    DropdownMenuItem({ Text("Delete", color = Stop) }, { menu = false; onDelete() },
+                        enabled = (ReconstructionService.state.value as? Job.Running)?.scan?.dir != s.dir)
+                }
             }
-            RoundButton(onClick = onDelete) { GlyphIcon(Glyph.Trash, Muted, 20.dp) }
         }
     }
 
@@ -531,6 +629,8 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun megabytes(b: Long) = String.format(Locale.ROOT, "%.1f MB", b / 1e6)
 
     @Suppress("unused")
     private fun Bitmap.aspect() = width.toFloat() / height

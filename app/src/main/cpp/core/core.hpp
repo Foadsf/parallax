@@ -49,6 +49,9 @@ struct Options {
     int denseMaxSide = 960;
     int maxDenseImages = 48;
     bool rollingShutter = true;    // model row-wise capture time in bundle adjustment
+    // Printed ArUco marker (DICT_4X4_50) of this edge length in the scene gives metric scale
+    // to single-camera scans; 0 disables detection.
+    double markerSizeMm = 0;
 };
 
 struct Result {
@@ -58,6 +61,7 @@ struct Result {
     int sparsePoints = 0, densePoints = 0;
     double meanReprojError = 0;    // pixels, after the final bundle adjustment
     double metresPerUnit = 0;      // 0 when the scale is unknown (single camera)
+    std::string scaleSource = "none";  // "marker", "rig" or "none"
     bool gravityAligned = false;
     std::vector<float> cameraCentres;  // xyz triples, in the exported frame
     std::vector<int> cameraImages;     // input image index of each centre
