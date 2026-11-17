@@ -5,6 +5,8 @@ import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.hardware.Sensor
+import android.hardware.SensorManager
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.GLES30
@@ -78,11 +80,14 @@ object DeviceProbe {
             "ISA" to runCatching { NativeCore.cpuFeatures() }.getOrDefault("?"),
             "RAM" to "%.1f GB".format(mem.totalMem / 1e9),
             "GPU (OpenGL ES)" to glRenderer(),
+            "GPU (Vulkan)" to runCatching { NativeCore.vulkanSummary() }.getOrDefault("?"),
             "GPU (OpenCL)" to runCatching { NativeCore.openclSummary() }.getOrDefault("?"),
+            "NPU / DSP" to runCatching { NativeCore.npuSummary() }.getOrDefault("?"),
             "Processing profile" to "${processing.name}: features at ${processing.featureMaxSide} px, dense at " +
                 "${processing.denseMaxSide} px, up to ${processing.maxDenseImages} dense views",
         )
         sections += "Cameras" to cameras(ctx)
+        sections += "Sensors" to sensors(ctx)
         return DeviceReport(sections, processing)
     }
 
@@ -97,11 +102,14 @@ object DeviceProbe {
 
     fun rom(): String {
         val lineage = prop("ro.lineage.version")
+        val oneui = prop("ro.build.version.oneui")
+        val eos = prop("ro.e.version")
+        val mod = prop("ro.modversion")
         val name = when {
             lineage.isNotEmpty() -> "LineageOS $lineage"
-            prop("ro.build.version.oneui").isNotEmpty() -> "Samsung One UI ${prop("ro.build.version.oneui")}"
-            prop("ro.e.version").isNotEmpty() -> "/e/OS ${prop("ro.e.version")}"
-            prop("ro.modversion").isNotEmpty() -> prop("ro.modversion")
+            oneui.isNotEmpty() -> "Samsung One UI $oneui"
+            eos.isNotEmpty() -> "/e/OS $eos"
+            mod.isNotEmpty() -> mod
             else -> Build.DISPLAY
         }
         return "$name (${Build.TYPE}, ${Build.TAGS})"
@@ -193,6 +201,8 @@ object DeviceProbe {
                 maxYuv?.let { "YUV up to ${it.width}×${it.height}" },
                 if (c.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION) != null) "factory calibration" else "no factory calibration",
                 if (l.position != null) "lens position known" else null,
+                if (c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                    CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "realtime clock" else "monotonic clock",
                 if (ois) "OIS" else null,
                 if (af) "autofocus" else "fixed focus",
                 torch,
@@ -205,5 +215,22 @@ object DeviceProbe {
             m.label + if (m is CaptureMode.Rig) " (metric, if the HAL accepts both streams)" else ""
         }.ifEmpty { "none" }
         return rows
+    }
+
+    private fun sensors(ctx: Context): List<Pair<String, String>> {
+        val sm = ctx.getSystemService(SensorManager::class.java) ?: return emptyList()
+        fun desc(type: Int): String {
+            val s = sm.getDefaultSensor(type) ?: return "not present"
+            val hz = if (s.minDelay > 0) "${(1_000_000.0 / s.minDelay).roundToInt()} Hz max" else "on-change"
+            return "${s.name} (${s.vendor}, $hz, res ${s.resolution})"
+        }
+        return listOf(
+            "Accelerometer" to desc(Sensor.TYPE_ACCELEROMETER),
+            "Gyroscope" to desc(Sensor.TYPE_GYROSCOPE),
+            "Magnetometer" to desc(Sensor.TYPE_MAGNETIC_FIELD),
+            "Barometer" to desc(Sensor.TYPE_PRESSURE),
+            "Gravity (HAL)" to desc(Sensor.TYPE_GRAVITY),
+            "Game rotation (HAL)" to desc(Sensor.TYPE_GAME_ROTATION_VECTOR),
+        )
     }
 }

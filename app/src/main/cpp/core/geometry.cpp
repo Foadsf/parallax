@@ -70,8 +70,7 @@ bool verifyPair(const State& s, int a, int b, const std::vector<std::pair<int, i
     cv::Mat mask;
     // Nister's five-point solver inside RANSAC on calibrated (normalized) coordinates.
     cv::Mat E = cv::findEssentialMat(pa, pb, cv::Mat::eye(3, 3, CV_64F), cv::RANSAC, 0.9999, thr, 4000, mask);
-    if (E.empty() || E.rows < 3) return false;
-    if (E.rows > 3) E = E.rowRange(0, 3).clone();
+    if (E.empty() || E.rows < 3 || E.cols != 3) return false;
 
     out = PairGeometry{};
     out.a = a;
@@ -80,10 +79,13 @@ bool verifyPair(const State& s, int a, int b, const std::vector<std::pair<int, i
         if (mask.at<uchar>(int(i))) out.inliers.push_back(matches[i]);
     if (out.inliers.size() < 25) return false;
 
-    cv::Mat R, t, poseMask = mask.clone();
-    cv::recoverPose(E, pa, pb, cv::Mat::eye(3, 3, CV_64F), R, t, poseMask);
-    out.R = cv::Matx33d(R);
-    out.t = cv::Vec3d(t);
+    int bestCheiral = -1;
+    for (int r = 0; r + 3 <= E.rows; r += 3) {
+        cv::Mat R, t, poseMask = mask.clone();
+        const int good = cv::recoverPose(E.rowRange(r, r + 3), pa, pb, cv::Mat::eye(3, 3, CV_64F), R, t, 1000.0, poseMask);
+        if (good > bestCheiral) { bestCheiral = good; out.R = cv::Matx33d(R); out.t = cv::Vec3d(t); }
+    }
+    if (bestCheiral < 15) return false;
 
     cv::Mat hmask;
     cv::Mat H = cv::findHomography(pa, pb, cv::RANSAC, 4.0 / f, hmask, 2000, 0.999);
@@ -123,10 +125,13 @@ bool triangulateTrack(State& s, int trackId) {
     for (size_t i = 0; i < obs.size(); ++i) {
         const Image& im = s.images[obs[i].image];
         const cv::Point2d& x = im.normalized[obs[i].keypoint];
+        const RowMotion m = rowMotion(s, im, im.pixels[obs[i].keypoint].y, im.R);
+        const cv::Matx33d R = m.A * im.R;
+        const cv::Vec3d t = m.A * (im.t + m.offset);
         for (int c = 0; c < 4; ++c) {
-            const double p0 = c < 3 ? im.R(0, c) : im.t[0];
-            const double p1 = c < 3 ? im.R(1, c) : im.t[1];
-            const double p2 = c < 3 ? im.R(2, c) : im.t[2];
+            const double p0 = c < 3 ? R(0, c) : t[0];
+            const double p1 = c < 3 ? R(1, c) : t[1];
+            const double p2 = c < 3 ? R(2, c) : t[2];
             A.at<double>(int(2 * i), c) = x.x * p2 - p0;
             A.at<double>(int(2 * i + 1), c) = x.y * p2 - p1;
         }

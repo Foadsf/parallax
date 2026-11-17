@@ -31,11 +31,13 @@ data class Lens(
     val sensorOrientation: Int,
     /** Optical centre in the device frame (metres), from LENS_POSE_TRANSLATION. */
     val position: FloatArray?,
+    val poseRotation: FloatArray? = null,
+    val fallbackSizes: List<Size> = emptyList(),
 ) {
     val key get() = physicalId?.let { "$openId/$it" } ?: openId
     fun yuvSizes(): List<Size> =
         chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+            ?.getOutputSizes(ImageFormat.YUV_420_888)?.toList()?.takeIf { it.isNotEmpty() } ?: fallbackSizes
 }
 
 sealed interface CaptureMode {
@@ -61,24 +63,35 @@ object CameraProbe {
             val physical = if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA in caps) {
                 c.physicalCameraIds
             } else emptySet()
+            val logicalSizes = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+            val physicalLenses = mutableListOf<Lens>()
             if (physical.size >= 2) {
                 for (pid in physical) {
                     val pc = runCatching { manager.getCameraCharacteristics(pid) }.getOrNull() ?: continue
-                    lensOf(id, pid, pc)?.let { out += it; seenPhysical += pid }
+                    lensOf(id, pid, pc, logicalSizes)?.let { out += it; physicalLenses += it; seenPhysical += pid }
                 }
             }
             // Standalone cameras (and logical cameras themselves, which stream "auto" lens choice).
-            if (id !in seenPhysical) lensOf(id, null, c)?.let { out += it }
+            if (id !in seenPhysical) {
+                val mainPhysical = physicalLenses.minByOrNull { abs(it.equivalentMm - 26f) }
+                lensOf(id, null, c)?.let { l ->
+                    out += if (mainPhysical != null) l.copy(focalMm = mainPhysical.focalMm, equivalentMm = mainPhysical.equivalentMm) else l
+                }
+            }
         }
         return out
     }
 
-    private fun lensOf(openId: String, physicalId: String?, c: CameraCharacteristics): Lens? {
-        val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return null
+    private fun lensOf(openId: String, physicalId: String?, c: CameraCharacteristics, fallbackSizes: List<Size> = emptyList()): Lens? {
+        val focals = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.takeIf { it.isNotEmpty() } ?: return null
         val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
-        val eq = focal * FULL_FRAME_DIAGONAL_MM / hypot(size.width, size.height)
+        val diag = hypot(size.width, size.height)
+        val focal = focals.minByOrNull { abs(it * FULL_FRAME_DIAGONAL_MM / diag - 26f) } ?: focals.first()
+        val eq = focal * FULL_FRAME_DIAGONAL_MM / diag
         val pos = c.get(CameraCharacteristics.LENS_POSE_TRANSLATION)?.takeIf { it.size == 3 }
-        return Lens(openId, physicalId, c, focal, eq, c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90, pos)
+        val rot = c.get(CameraCharacteristics.LENS_POSE_ROTATION)?.takeIf { it.size == 4 }
+        return Lens(openId, physicalId, c, focal, eq, c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90, pos, rot, fallbackSizes)
     }
 
     /** Capture modes, best first: a two-camera rig when available, then each lens on its own. */
@@ -145,7 +158,7 @@ object CameraProbe {
             cyA = calib[3] + (pre.top - active.top).toDouble()
         } else {
             val phys = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)!!
-            val pixels = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)!!
+            val pixels = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) ?: Size(active.width(), active.height())
             fx = lens.focalMm / phys.width * pixels.width.toDouble()
             fy = lens.focalMm / phys.height * pixels.height.toDouble()
             cxA = active.width() / 2.0 - 0.5

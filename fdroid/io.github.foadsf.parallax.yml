@@ -1,7 +1,7 @@
 Categories:
   - Multimedia
   - Science & Education
-License: GPL-3.0-only
+License: GPL-3.0-or-later
 AuthorName: Foad S. Farimani
 SourceCode: https://github.com/Foadsf/parallax
 IssueTracker: https://github.com/Foadsf/parallax/issues
@@ -12,9 +12,9 @@ RepoType: git
 Repo: https://github.com/Foadsf/parallax.git
 
 Builds:
-  - versionName: 0.1.0
-    versionCode: 1
-    commit: v0.1.0
+  - versionName: 0.4.0
+    versionCode: 4
+    commit: v0.4.0
     subdir: app
     gradle:
       - yes
@@ -23,5 +23,5 @@ Builds:
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
-CurrentVersion: 0.1.0
-CurrentVersionCode: 1
+CurrentVersion: 0.4.0
+CurrentVersionCode: 4

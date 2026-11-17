@@ -3,12 +3,18 @@
 #include "probe.hpp"
 
 #include <dlfcn.h>
+#include <sched.h>
 #include <sys/auxv.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
+
+#include <opencv2/core/utility.hpp>
 
 #if defined(__aarch64__)
 #include <asm/hwcap.h>
@@ -96,6 +102,94 @@ std::string openclSummary() {
     }
     dlclose(h);
     return out;
+}
+
+std::string vulkanSummary() {
+    void* h = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return "not available";
+    auto getProc = reinterpret_cast<void* (*)(void*, const char*)>(dlsym(h, "vkGetInstanceProcAddr"));
+    if (!getProc) { dlclose(h); return "loader incomplete"; }
+    struct AppInfo { uint32_t sType; const void* pNext; const char* app; uint32_t av; const char* eng; uint32_t ev; uint32_t api; };
+    struct InstInfo { uint32_t sType; const void* pNext; uint32_t flags; const AppInfo* app; uint32_t lc; const char* const* l; uint32_t ec; const char* const* e; };
+    struct Props { uint32_t api, drv, vendor, devId, devType; char name[256]; uint8_t pad[656]; };
+    auto createInst = reinterpret_cast<int32_t (*)(const InstInfo*, const void*, void**)>(getProc(nullptr, "vkCreateInstance"));
+    if (!createInst) { dlclose(h); return "no vkCreateInstance"; }
+    AppInfo ai{0, nullptr, "Parallax", 1, "Parallax", 1, (1u << 22)};
+    InstInfo ii{1, nullptr, 0, &ai, 0, nullptr, 0, nullptr};
+    void* inst = nullptr;
+    if (createInst(&ii, nullptr, &inst) != 0 || !inst) { dlclose(h); return "instance init failed"; }
+    auto destroyInst = reinterpret_cast<void (*)(void*, const void*)>(getProc(inst, "vkDestroyInstance"));
+    auto enumDevs = reinterpret_cast<int32_t (*)(void*, uint32_t*, void**)>(getProc(inst, "vkEnumeratePhysicalDevices"));
+    auto getProps = reinterpret_cast<void (*)(void*, Props*)>(getProc(inst, "vkGetPhysicalDeviceProperties"));
+    std::string out = "no Vulkan GPU";
+    uint32_t n = 0;
+    if (enumDevs && getProps && enumDevs(inst, &n, nullptr) == 0 && n > 0) {
+        std::vector<void*> devs(std::min(n, 4u));
+        n = uint32_t(devs.size());
+        if (enumDevs(inst, &n, devs.data()) == 0 && n > 0) {
+            Props p{}; getProps(devs[0], &p);
+            char buf[320];
+            std::snprintf(buf, sizeof buf, "%s (Vulkan %u.%u.%u)", p.name, (p.api >> 22) & 0x3FF, (p.api >> 12) & 0x3FF, p.api & 0xFFF);
+            out = buf;
+        }
+    }
+    if (destroyInst) destroyInst(inst, nullptr);
+    dlclose(h);
+    return out;
+}
+
+std::string npuSummary() {
+    void* h = dlopen("libneuralnetworks.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return "not exposed via NNAPI";
+    auto getCount = reinterpret_cast<int (*)(uint32_t*)>(dlsym(h, "ANeuralNetworks_getDeviceCount"));
+    auto getDev = reinterpret_cast<int (*)(uint32_t, void**)>(dlsym(h, "ANeuralNetworks_getDevice"));
+    auto getName = reinterpret_cast<int (*)(const void*, const char**)>(dlsym(h, "ANeuralNetworksDevice_getName"));
+    auto getType = reinterpret_cast<int (*)(const void*, int32_t*)>(dlsym(h, "ANeuralNetworksDevice_getType"));
+    std::string out; uint32_t n = 0;
+    if (getCount && getDev && getName && getType && getCount(&n) == 0) {
+        for (uint32_t i = 0; i < n; ++i) {
+            void* d = nullptr; int32_t t = 0; const char* name = nullptr;
+            if (getDev(i, &d) == 0 && getType(d, &t) == 0 && getName(d, &name) == 0 && t >= 2 && name) {
+                if (!out.empty()) out += ", ";
+                out += std::string(name) + (t == 4 ? " (NPU/DSP)" : (t == 3 ? " (GPU)" : ""));
+            }
+        }
+    }
+    dlclose(h);
+    return out.empty() ? "CPU fallback only" : out;
+}
+
+int configureOptimalThreads() {
+    const int total = std::max(1, cv::getNumberOfCPUs());
+    std::vector<long> freqs(total, 0);
+    long maxFreq = 0, minFreq = (1L << 30);
+    for (int i = 0; i < total; ++i) {
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+        if (f >> freqs[i] && freqs[i] > 100000) { maxFreq = std::max(maxFreq, freqs[i]); minFreq = std::min(minFreq, freqs[i]); }
+    }
+    std::vector<int> perfIds;
+    if (maxFreq > 0 && minFreq < maxFreq * 65 / 100)
+        for (int i = 0; i < total; ++i) if (freqs[i] >= maxFreq * 65 / 100) perfIds.push_back(i);
+    int target = int(perfIds.size()) >= 4 ? int(perfIds.size()) : total;
+#if defined(__linux__) || defined(__ANDROID__)
+    if (int(perfIds.size()) >= 4) {
+        cpu_set_t mask; CPU_ZERO(&mask);
+        for (int id : perfIds) CPU_SET(id, &mask);
+        sched_setaffinity(0, sizeof(mask), &mask);
+    }
+#endif
+    if (void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL)) {
+        auto acq = reinterpret_cast<void* (*)()>(dlsym(lib, "AThermal_acquireManager"));
+        auto status = reinterpret_cast<int (*)(void*)>(dlsym(lib, "AThermal_getCurrentThermalStatus"));
+        auto rel = reinterpret_cast<void (*)(void*)>(dlsym(lib, "AThermal_releaseManager"));
+        if (acq && status && rel) {
+            if (void* mgr = acq()) { if (status(mgr) >= 3) target = std::max(2, target / 2); rel(mgr); }
+        }
+        dlclose(lib);
+    }
+    cv::setNumThreads(target);
+    return target;
 }
 
 }  // namespace parallax

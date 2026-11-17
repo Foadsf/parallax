@@ -36,6 +36,8 @@ struct ImageInput {
     double time = 0, rollingShutterSkew = 0;
     double gyroX = 0, gyroY = 0, gyroZ = 0;
     bool hasGyro = false;
+    double imuQw = 1, imuQx = 0, imuQy = 0, imuQz = 0;
+    bool hasImuQuat = false;
 };
 
 struct Options {

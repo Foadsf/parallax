@@ -30,9 +30,11 @@ import android.util.Size
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -86,6 +88,143 @@ object Coverage {
     }
 }
 
+private class ImuTracker {
+    private class Sample(val tNs: Long, val x: Float, val y: Float, val z: Float)
+    private val gyroBuf = ArrayDeque<Sample>(256)
+    private val gravBuf = ArrayDeque<Sample>(256)
+    private var lastGyroNs = 0L
+    private var qw = 1.0; private var qx = 0.0; private var qy = 0.0; private var qz = 0.0
+    private var quatInit = false
+    private var bx = 0f; private var by = 0f; private var bz = 0f
+    private var lastAcc = floatArrayOf(0f, 0f, 9.81f)
+    private var lastMag: FloatArray? = null
+    private var hasHardwareGravity = false; private var hasHardwareRot = false; private var hasCalibratedGyro = false
+    private var p0Hpa = 0f
+    var baroAltitudeM: Float? = null; private set
+    var hasGyro = false; private set
+    var gyroRate = 0f; private set
+    var rotationVector: FloatArray? = null; private set
+
+    fun resetScanOrigin() { p0Hpa = 0f; baroAltitudeM = null }
+
+    fun onSensor(e: SensorEvent) {
+        when (e.sensor.type) {
+            Sensor.TYPE_GRAVITY -> { hasHardwareGravity = true; pushGrav(e.timestamp, e.values[0], e.values[1], e.values[2]) }
+            Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> {
+                if (e.sensor.type == Sensor.TYPE_ACCELEROMETER_UNCALIBRATED && e.values.size < 6) return
+                val ax = if (e.sensor.type == Sensor.TYPE_ACCELEROMETER_UNCALIBRATED) e.values[0] - e.values[3] else e.values[0]
+                val ay = if (e.sensor.type == Sensor.TYPE_ACCELEROMETER_UNCALIBRATED) e.values[1] - e.values[4] else e.values[1]
+                val az = if (e.sensor.type == Sensor.TYPE_ACCELEROMETER_UNCALIBRATED) e.values[2] - e.values[5] else e.values[2]
+                lastAcc = floatArrayOf(ax, ay, az)
+                val norm = sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
+                if (!quatInit && norm > 5f) initFromAccel(ax / norm, ay / norm, az / norm)
+                if (quatInit && norm in 8.2f..11.4f) {
+                    val ux = (ax / norm).toDouble(); val uy = (ay / norm).toDouble(); val uz = (az / norm).toDouble()
+                    val vx = 2.0 * (qx * qz - qw * qy); val vy = 2.0 * (qy * qz + qw * qx); val vz = qw * qw - qx * qx - qy * qy + qz * qz
+                    val kp = if (hasGyro) 0.02 else 0.25
+                    integrateQuat((kp * (uy * vz - uz * vy)).toFloat(), (kp * (uz * vx - ux * vz)).toFloat(), (kp * (ux * vy - uy * vx)).toFloat(), 1.0)
+                }
+                if (!hasHardwareGravity) {
+                    if (quatInit) pushGrav(e.timestamp, (2.0 * (qx * qz - qw * qy) * 9.81).toFloat(),
+                        (2.0 * (qy * qz + qw * qx) * 9.81).toFloat(), ((qw * qw - qx * qx - qy * qy + qz * qz) * 9.81).toFloat())
+                    else pushGrav(e.timestamp, ax, ay, az)
+                }
+                if (!hasHardwareRot && !hasGyro) updateFallbackRotation()
+            }
+            Sensor.TYPE_GYROSCOPE -> { hasCalibratedGyro = true; processGyro(e.timestamp, e.values[0], e.values[1], e.values[2]) }
+            Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> {
+                if (!hasCalibratedGyro && e.values.size >= 6)
+                    processGyro(e.timestamp, e.values[0] - e.values[3], e.values[1] - e.values[4], e.values[2] - e.values[5])
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> { lastMag = e.values.copyOf(3); if (!hasHardwareRot && !hasGyro) updateFallbackRotation() }
+            Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_ROTATION_VECTOR -> { hasHardwareRot = true; rotationVector = e.values.copyOf() }
+            Sensor.TYPE_PRESSURE -> {
+                val p = e.values[0]
+                if (p > 100f) { if (p0Hpa == 0f) p0Hpa = p; baroAltitudeM = (44330.0 * (1.0 - (p / p0Hpa).toDouble().pow(0.190295))).toFloat() }
+            }
+        }
+    }
+
+    private fun processGyro(tNs: Long, wx: Float, wy: Float, wz: Float) {
+        hasGyro = true
+        val rawRate = sqrt(wx * wx + wy * wy + wz * wz)
+        val accNorm = sqrt(lastAcc[0] * lastAcc[0] + lastAcc[1] * lastAcc[1] + lastAcc[2] * lastAcc[2])
+        if (rawRate < 0.06f && abs(accNorm - 9.81f) < 0.35f) {
+            bx = 0.995f * bx + 0.005f * wx; by = 0.995f * by + 0.005f * wy; bz = 0.995f * bz + 0.005f * wz
+        }
+        val cx = wx - bx; val cy = wy - by; val cz = wz - bz
+        gyroRate = 0.7f * gyroRate + 0.3f * sqrt(cx * cx + cy * cy + cz * cz)
+        if (lastGyroNs != 0L) {
+            val dt = ((tNs - lastGyroNs) * 1e-9).coerceIn(0.0, 0.1)
+            if (quatInit && dt > 0.0) integrateQuat(cx, cy, cz, dt)
+        }
+        lastGyroNs = tNs
+        gyroBuf.addLast(Sample(tNs, cx, cy, cz))
+        while (gyroBuf.size > 250) gyroBuf.removeFirst()
+        if (!hasHardwareRot && quatInit) rotationVector = floatArrayOf(qx.toFloat(), qy.toFloat(), qz.toFloat(), qw.toFloat())
+    }
+
+    private fun initFromAccel(ux: Float, uy: Float, uz: Float) {
+        val s = sqrt((1.0 + uz.toDouble().coerceIn(-1.0, 1.0)) * 2.0)
+        if (s > 1e-6) { qw = 0.5 * s; qx = uy / s; qy = -ux / s; qz = 0.0; normQuat(); quatInit = true }
+    }
+
+    private fun integrateQuat(wx: Float, wy: Float, wz: Float, dt: Double) {
+        val hx = 0.5 * wx * dt; val hy = 0.5 * wy * dt; val hz = 0.5 * wz * dt
+        val nw = qw - qx * hx - qy * hy - qz * hz; val nx = qx + qw * hx + qy * hz - qz * hy
+        val ny = qy + qw * hy - qx * hz + qz * hx; val nz = qz + qw * hz + qx * hy - qy * hx
+        qw = nw; qx = nx; qy = ny; qz = nz; normQuat()
+    }
+
+    private fun normQuat() {
+        val n = sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+        if (n > 1e-12) { qw /= n; qx /= n; qy /= n; qz /= n }
+    }
+
+    private fun updateFallbackRotation() {
+        val mag = lastMag ?: return
+        val r = FloatArray(9)
+        if (SensorManager.getRotationMatrix(r, null, lastAcc, mag)) {
+            val tr = r[0] + r[4] + r[8]
+            if (tr > 0f) {
+                val s = sqrt(tr + 1.0f) * 2f
+                rotationVector = floatArrayOf((r[7] - r[5]) / s, (r[2] - r[6]) / s, (r[3] - r[1]) / s, 0.25f * s)
+            }
+        }
+    }
+
+    private fun pushGrav(tNs: Long, x: Float, y: Float, z: Float) {
+        gravBuf.addLast(Sample(tNs, x, y, z))
+        while (gravBuf.size > 250) gravBuf.removeFirst()
+    }
+
+    fun gravityAt(tMidNs: Long): FloatArray {
+        if (gravBuf.isEmpty()) return lastAcc.copyOf()
+        val t = if (abs(tMidNs - gravBuf.last().tNs) > 5_000_000_000L) gravBuf.last().tNs else tMidNs
+        val best = gravBuf.minByOrNull { abs(it.tNs - t) } ?: gravBuf.last()
+        return floatArrayOf(best.x, best.y, best.z)
+    }
+
+    fun gyroOverWindow(tStartNs: Long, tEndNs: Long): FloatArray? {
+        if (!hasGyro || gyroBuf.isEmpty()) return null
+        val last = gyroBuf.last().tNs
+        val shift = if (abs(tStartNs - last) > 5_000_000_000L) last - (tStartNs + tEndNs) / 2 else 0L
+        val a = tStartNs + shift - 5_000_000L; val b = tEndNs + shift + 5_000_000L
+        var sx = 0f; var sy = 0f; var sz = 0f; var n = 0
+        for (s in gyroBuf) if (s.tNs in a..b) { sx += s.x; sy += s.y; sz += s.z; ++n }
+        if (n > 0) return floatArrayOf(sx / n, sy / n, sz / n)
+        val nearest = gyroBuf.minByOrNull { abs(it.tNs - ((tStartNs + tEndNs) / 2 + shift)) } ?: return null
+        return floatArrayOf(nearest.x, nearest.y, nearest.z)
+    }
+
+    fun cameraQuat(sensorOrientation: Int): FloatArray? {
+        if (!quatInit && rotationVector == null) return null
+        val th = Math.toRadians(sensorOrientation.toDouble())
+        val c = cos(th / 2.0); val s = sin(th / 2.0)
+        return floatArrayOf((-(qx * c - qy * s)).toFloat(), (qw * c + qz * s).toFloat(), (-qw * s + qz * c).toFloat(), (-qx * s - qy * c).toFloat())
+    }
+}
+
 /**
  * Camera2 capture: one YUV stream per lens (two for a rig), live keyframe selection in native
  * code, keyframes saved as JPEG with their metadata. All camera work runs on [thread].
@@ -95,6 +234,7 @@ class CaptureController(
     private val onPreview: (Bitmap) -> Unit,
     private val onState: (LiveState) -> Unit,
     private val onError: (String) -> Unit,
+    private val onFallback: (CaptureMode, CaptureMode) -> Unit = { _, _ -> },
 ) : SensorEventListener {
     private val manager = context.getSystemService(CameraManager::class.java)
     private val sensors = context.getSystemService(SensorManager::class.java)
@@ -113,7 +253,7 @@ class CaptureController(
     private val recentSecondary = ArrayDeque<Image>()
     private var pendingSecondary: PendingSecondary? = null
     // Keyframes are encoded and written off the camera thread, so tracking never stalls.
-    private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "parallax-writer") }
+    private var writer: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "parallax-writer") }
     private var size = Size(1280, 960)
     private var rig = false
 
@@ -138,30 +278,33 @@ class CaptureController(
     private val previews = arrayOfNulls<Bitmap>(3)
     private var previewIndex = 0
 
-    // Sensors (main thread writes, camera thread reads).
-    @Volatile private var gravity = FloatArray(3)
-    @Volatile private var gyroRate = 0f
-    @Volatile private var gyro = FloatArray(3)          // rad/s, device axes
-    @Volatile private var rotation: FloatArray? = null  // game rotation vector
+    private val imu = ImuTracker()
     private var rsSkewNs = 0L
     private var azimuth0 = 0.0
     private val coverage = BooleanArray(Coverage.BINS)
 
     fun open(m: CaptureMode) {
         close()
+        if (writer.isShutdown) writer = Executors.newSingleThreadExecutor { r -> Thread(r, "parallax-writer") }
         mode = m
         thread = HandlerThread("parallax-camera").also { it.start() }
         handler = Handler(thread!!.looper)
-        val g = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        g?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        for (type in intArrayOf(
+            Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_GYROSCOPE, Sensor.TYPE_GYROSCOPE_UNCALIBRATED,
+            Sensor.TYPE_GRAVITY, Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_PRESSURE,
+        )) {
+            sensors.getDefaultSensor(type)?.let { s ->
+                runCatching { sensors.registerListener(this, s, SensorManager.SENSOR_DELAY_FASTEST, handler) }
+                    .onFailure { sensors.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME, handler) }
+            }
+        }
         handler!!.post { openCamera(m) }
     }
 
     fun close() {
         sensors.unregisterListener(this)
         val h = handler ?: return
+        val w = writer
         h.post {
             if (scanning) finishScan()
             runCatching { session?.close() }
@@ -169,7 +312,7 @@ class CaptureController(
             recentSecondary.forEach { it.close() }
             recentSecondary.clear()
             pendingSecondary = null
-            writer.shutdown()
+            w.shutdown()
             primaryReader?.close(); secondaryReader?.close()
             session = null; device = null; primaryReader = null; secondaryReader = null
         }
@@ -186,8 +329,9 @@ class CaptureController(
         images.clear()
         keyframes = 0
         NativeCore.trackerReset()
+        imu.resetScanOrigin()
         coverage.fill(false)
-        azimuth0 = rotation?.let { Coverage.azimuth(it) } ?: 0.0
+        azimuth0 = imu.rotationVector?.let { Coverage.azimuth(it) } ?: 0.0
         scanning = true
         scanStartMs = SystemClock.elapsedRealtime()
         afState = null
@@ -202,6 +346,7 @@ class CaptureController(
     /** Stops the scan and returns it (null if nothing was captured) on the main thread. */
     fun stopScan(done: (Scan?) -> Unit) = handler?.post {
         val s = finishScan()
+        keyframes = 0
         main.post { done(s) }
     }
 
@@ -292,7 +437,10 @@ class CaptureController(
         primaryReader = null; secondaryReader = null
         if (next == null) { main.post { onError("This camera configuration is not supported") }; return }
         mode = next
-        main.post { onError("${m.label} is not available on this phone; using ${next.label}") }
+        main.post {
+            onFallback(m, next)
+            onError("${m.label} is not available on this phone; using ${next.label}")
+        }
         openCamera(next)
     }
 
@@ -308,7 +456,7 @@ class CaptureController(
             applyControls(b, c)
             if (cancelFocus && hasAutofocus(c)) {
                 b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
-                s.capture(b.build(), null, handler)
+                s.capture(b.build(), resultCallback, handler)
                 b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
             }
             s.setRepeatingRequest(b.build(), resultCallback, handler)
@@ -432,7 +580,7 @@ class CaptureController(
 
             if (scanning) {
                 val now = SystemClock.elapsedRealtime()
-                val steady = gyroRate < 0.8f
+                val steady = imu.gyroRate < 0.8f
                 // Wait for the focus trigger to settle (or 800 ms), so every keyframe shares one focus.
                 val focused = !hasAutofocus(m.primary.chars) || now - scanStartMs > 800 ||
                     afState == CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED ||
@@ -483,21 +631,35 @@ class CaptureController(
 
     private fun saveKeyframe(primary: Image) {
         val s = scan ?: return
-        val up = upInCamera(cameras[0].sensorOrientation)
+        val tStart = primary.timestamp
+        val tEnd = tStart + exposureNs + rsSkewNs
+        val tMid = tStart + exposureNs / 2 + rsSkewNs / 2
+        val gDev = imu.gravityAt(tMid)
+        val w = imu.gyroOverWindow(tStart, tEnd)
+        val up = toCamera(cameras[0].sensorOrientation, gDev)
         val group = keyframes
-        val w = gyro
         val name = "p_%04d.jpg".format(group)
         val copy = YuvCopy(primary)
         writer.execute { copy.saveJpeg(File(s.imagesDir, name)) }
-        images += ScanImage(name, 0, if (rig) group else -1, up, primary.timestamp,
-            exposureNs, iso, focusDiopters, torchOn, rsSkewNs, toCamera(cameras[0].sensorOrientation, w))
-        rotation?.let { coverage[Coverage.bin(it, azimuth0)] = true }
+        images += ScanImage(name, 0, if (rig) group else -1, up, tMid,
+            exposureNs, iso, focusDiopters, torchOn, rsSkewNs,
+            w?.let { toCamera(cameras[0].sensorOrientation, it) },
+            imu.cameraQuat(cameras[0].sensorOrientation), imu.baroAltitudeM)
+        imu.rotationVector?.let {
+            if (group == 0) azimuth0 = Coverage.azimuth(it)
+            coverage[Coverage.bin(it, azimuth0)] = true
+        }
         if (rig) {
-            val meta = ScanImage("s_%04d.jpg".format(group), 1, group, upInCamera(cameras[1].sensorOrientation),
-                primary.timestamp, exposureNs, iso, focusDiopters, torchOn, rsSkewNs, toCamera(cameras[1].sensorOrientation, w))
+            val meta = ScanImage("s_%04d.jpg".format(group), 1, group, toCamera(cameras[1].sensorOrientation, gDev),
+                tMid, exposureNs, iso, focusDiopters, torchOn, rsSkewNs,
+                w?.let { toCamera(cameras[1].sensorOrientation, it) },
+                imu.cameraQuat(cameras[1].sensorOrientation), imu.baroAltitudeM)
             val match = recentSecondary.firstOrNull { abs(it.timestamp - primary.timestamp) < SYNC_NS }
-            if (match != null) writeSecondary(match, meta)
-            else pendingSecondary = PendingSecondary(group, primary.timestamp, SystemClock.elapsedRealtime() + 200, meta)
+            if (match != null) {
+                writeSecondary(match, meta)
+                recentSecondary.remove(match)
+                match.close()
+            } else pendingSecondary = PendingSecondary(group, primary.timestamp, SystemClock.elapsedRealtime() + 200, meta)
         }
         keyframes++
         NativeCore.trackerMarkKeyframe()
@@ -523,7 +685,7 @@ class CaptureController(
         val s = scan ?: return
         val copy = YuvCopy(img)
         writer.execute { copy.saveJpeg(File(s.imagesDir, meta.file)) }
-        images += meta.copy(timestampNs = img.timestamp)
+        images += meta.copy(timestampNs = img.timestamp + exposureNs / 2 + rsSkewNs / 2)
     }
 
     private fun expirePendingSecondary(now: Long) {
@@ -548,12 +710,6 @@ class CaptureController(
         return r
     }
 
-    /**
-     * Gravity reaction ("up") in OpenCV camera coordinates (x right, y down, z forward) of a rear
-     * camera with the given SENSOR_ORIENTATION, from the device-frame gravity sensor.
-     */
-    private fun upInCamera(orientation: Int): FloatArray = toCamera(orientation, gravity)
-
     /** A device-frame vector (gravity, angular rate) in the rear camera's OpenCV axes. */
     private fun toCamera(orientation: Int, v: FloatArray): FloatArray {
         val th = Math.toRadians(orientation.toDouble())
@@ -563,7 +719,7 @@ class CaptureController(
     }
 
     private fun publish(newHint: String?) {
-        val heading = rotation?.let { Coverage.bin(it, azimuth0) } ?: -1
+        val heading = imu.rotationVector?.let { Coverage.bin(it, azimuth0) } ?: -1
         val st = LiveState(lastPoints, lastProgress, lastTracked, keyframes, scanning, torchOn,
             newHint ?: hint, mode?.label ?: "", rig && cameras.size == 2 && cameras.all { it.position != null },
             coverage.copyOf(), heading)
@@ -572,22 +728,7 @@ class CaptureController(
 
     // ---- Sensors (main thread) --------------------------------------------------------------
 
-    override fun onSensorChanged(e: SensorEvent) {
-        when (e.sensor.type) {
-            Sensor.TYPE_GRAVITY -> gravity = e.values.copyOf(3)
-            Sensor.TYPE_ACCELEROMETER -> {  // low-pass fallback when there is no fused gravity sensor
-                val g = gravity
-                gravity = FloatArray(3) { 0.9f * g[it] + 0.1f * e.values[it] }
-            }
-            Sensor.TYPE_GYROSCOPE -> {
-                val w = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2])
-                gyroRate = 0.7f * gyroRate + 0.3f * w
-                val g = gyro
-                gyro = FloatArray(3) { 0.5f * g[it] + 0.5f * e.values[it] }
-            }
-            Sensor.TYPE_GAME_ROTATION_VECTOR -> rotation = e.values.copyOf()
-        }
-    }
+    override fun onSensorChanged(e: SensorEvent) = imu.onSensor(e)
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 }

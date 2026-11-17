@@ -40,9 +40,11 @@ public:
     void markKeyframe();
 
 private:
+    void topUpLocked(const cv::Mat& gray, bool asKeyframeAnchor);
     std::mutex mtx_;
     cv::Mat prev_;
     std::vector<cv::Point2f> pts_, anchors_;
+    std::vector<uint8_t> fromKf_;
     int anchorsAtKeyframe_ = 0;
     float sharpRef_ = 0;
     bool wantFirst_ = true, topUp_ = true;

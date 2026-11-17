@@ -21,6 +21,10 @@ data class ScanImage(
     val rsSkewNs: Long = 0,
     /** Gyroscope rate in camera axes (rad/s) at capture, or null. */
     val gyro: FloatArray? = null,
+    /** Device-frame rotation quaternion (x, y, z, w) at capture, or null. */
+    val imuQuat: FloatArray? = null,
+    /** Barometric altitude in metres relative to the scan origin, or null. */
+    val baroAltitudeM: Float? = null,
 )
 
 /**
@@ -81,6 +85,8 @@ class Scan(val dir: File) {
                 put("focusDiopters", i.focusDiopters.toDouble()); put("torch", i.torch)
                 put("rollingShutterSkewNs", i.rsSkewNs)
                 i.gyro?.let { g -> put("gyro", JSONArray().apply { g.forEach { put(it.toDouble()) } }) }
+                i.imuQuat?.let { q -> put("imuQuat", JSONArray().apply { q.forEach { put(it.toDouble()) } }) }
+                i.baroAltitudeM?.let { h -> put("baroAltitudeM", h.toDouble()) }
             })
         })
         val tmp = File(dir, "scan.json.tmp")
@@ -114,7 +120,9 @@ class Scan(val dir: File) {
                     FloatArray(3) { up.getDouble(it).toFloat() }, i.getLong("timestampNs"), i.getLong("exposureNs"),
                     i.getInt("iso"), i.getDouble("focusDiopters").toFloat(), i.getBoolean("torch"),
                     i.optLong("rollingShutterSkewNs", 0L),
-                    i.optJSONArray("gyro")?.let { g -> FloatArray(3) { g.getDouble(it).toFloat() } })
+                    i.optJSONArray("gyro")?.takeIf { it.length() == 3 }?.let { g -> FloatArray(3) { g.getDouble(it).toFloat() } },
+                    i.optJSONArray("imuQuat")?.takeIf { it.length() == 4 }?.let { q -> FloatArray(4) { q.getDouble(it).toFloat() } },
+                    if (i.has("baroAltitudeM")) i.optDouble("baroAltitudeM").toFloat() else null)
             }
         }
         Loaded(cams, imgs)
@@ -128,7 +136,10 @@ object ScanStore {
 
     fun create(ctx: Context): Scan {
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
-        val dir = File(root(ctx), stamp)
+        val base = root(ctx)
+        var dir = File(base, stamp)
+        var suffix = 2
+        while (dir.exists()) dir = File(base, "$stamp-${suffix++}")
         File(dir, "images").mkdirs()
         return Scan(dir)
     }

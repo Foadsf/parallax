@@ -58,6 +58,12 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_cpuFeatures(
 JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_openclSummary(JNIEnv* env, jobject) {
     return env->NewStringUTF(openclSummary().c_str());
 }
+JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_vulkanSummary(JNIEnv* env, jobject) {
+    return env->NewStringUTF(vulkanSummary().c_str());
+}
+JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_npuSummary(JNIEnv* env, jobject) {
+    return env->NewStringUTF(npuSummary().c_str());
+}
 
 JNIEXPORT void JNICALL Java_io_github_foadsf_parallax_NativeCore_trackerReset(JNIEnv*, jobject) { gTracker.reset(); }
 
@@ -126,6 +132,7 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
         opt.maxDenseImages = o[4];
         opt.markerSizeMm = o[5];
     }
+    configureOptimalThreads();
     Reconstructor rec(opt);
     const int nc = env->GetArrayLength(cameraFlags);
     std::vector<jdouble> c(size_t(nc) * 15);
@@ -151,8 +158,9 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
     env->GetIntArrayRegion(imageCams, 0, ni, cams.data());
     env->GetIntArrayRegion(imageRig, 0, ni, rig.data());
     env->GetFloatArrayRegion(imageUp, 0, ni * 3, up.data());
-    std::vector<jdouble> motion(size_t(ni) * 6);
-    env->GetDoubleArrayRegion(imageMotion, 0, ni * 6, motion.data());
+    const int mStride = ni > 0 ? int(env->GetArrayLength(imageMotion) / ni) : 6;
+    std::vector<jdouble> motion(size_t(ni) * mStride);
+    if (ni > 0) env->GetDoubleArrayRegion(imageMotion, 0, ni * mStride, motion.data());
     for (int i = 0; i < ni; ++i) {
         auto js = static_cast<jstring>(env->GetObjectArrayElement(images, i));
         ImageInput in;
@@ -163,11 +171,15 @@ JNIEXPORT jstring JNICALL Java_io_github_foadsf_parallax_NativeCore_reconstruct(
         in.upX = up[3 * i];
         in.upY = up[3 * i + 1];
         in.upZ = up[3 * i + 2];
-        const double* mo = &motion[size_t(i) * 6];
+        const double* mo = &motion[size_t(i) * mStride];
         in.time = mo[0];
         in.rollingShutterSkew = mo[1];
         in.gyroX = mo[2]; in.gyroY = mo[3]; in.gyroZ = mo[4];
         in.hasGyro = mo[5] > 0.5;
+        if (mStride >= 11 && mo[10] > 0.5) {
+            in.imuQw = mo[6]; in.imuQx = mo[7]; in.imuQy = mo[8]; in.imuQz = mo[9];
+            in.hasImuQuat = true;
+        }
         rec.addImage(in);
     }
 

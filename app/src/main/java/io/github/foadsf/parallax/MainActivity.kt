@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.hardware.camera2.CameraManager
 import android.os.Build
 import android.os.Bundle
@@ -133,14 +134,15 @@ class MainActivity : ComponentActivity() {
         setContent {
             val job by ReconstructionService.state.collectAsState()
             LaunchedEffect(job, screen) {
-                val j = job
-                if (screen !is Screen.Processing) return@LaunchedEffect
-                when (j) {
-                    is Job.Done -> { ReconstructionService.acknowledge(); go(Screen.Viewer(j.scan)) }
+                when (val j = job) {
+                    is Job.Done -> {
+                        ReconstructionService.acknowledge()
+                        if (screen is Screen.Processing) go(Screen.Viewer(j.scan))
+                    }
                     is Job.Failed -> {
                         ReconstructionService.acknowledge()
                         Toast.makeText(this@MainActivity, j.message, Toast.LENGTH_LONG).show()
-                        go(Screen.Scans)
+                        if (screen is Screen.Processing) go(Screen.Scans)
                     }
                     else -> {}
                 }
@@ -149,7 +151,7 @@ class MainActivity : ComponentActivity() {
                 Box(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
                     when (val s = screen) {
                         Screen.Capture -> CaptureScreen()
-                        Screen.Scans -> ScansScreen()
+                        Screen.Scans -> ScansScreen(job)
                         is Screen.Processing -> ProcessingScreen(s.scan, job)
                         is Screen.Viewer -> ViewerScreen(s.scan)
                         Screen.Device -> DeviceScreen()
@@ -175,6 +177,17 @@ class MainActivity : ComponentActivity() {
             onPreview = { preview = it.asImageBitmap() },
             onState = { live = it },
             onError = { Toast.makeText(this, it, Toast.LENGTH_LONG).show() },
+            onFallback = { failed, fallback ->
+                val remaining = modes.filterNot { it == failed }
+                val idx = remaining.indexOfFirst { it.label == fallback.label }
+                if (idx >= 0) {
+                    modes = remaining
+                    modeIndex = idx
+                } else {
+                    modes = listOf(fallback) + remaining
+                    modeIndex = 0
+                }
+            },
         ).also {
             it.torchMode = torch
             it.open(modes[modeIndex.coerceIn(0, modes.lastIndex)])
@@ -383,6 +396,7 @@ class MainActivity : ComponentActivity() {
         var loading by remember { mutableStateOf(true) }
         var pointSize by remember { mutableStateOf(1) }   // index into sizes
         var frustaOn by remember { mutableStateOf(true) }
+        var initialLoad by remember(scan) { mutableStateOf(true) }
         val sizes = floatArrayOf(0.5f, 1f, 2f)
         LaunchedEffect(view, dense) {
             val v = view ?: return@LaunchedEffect
@@ -391,7 +405,8 @@ class MainActivity : ComponentActivity() {
                 val c = Cloud.readPly(if (dense) scan.dense else scan.sparse)
                 c to c?.let { Frusta.fromColmap(File(scan.dir, "sparse/0"), it.radius * 0.07f) }
             }
-            v.show(cloud, frusta, metric = (report?.optDouble("metresPerUnit", 0.0) ?: 0.0) > 0)
+            v.show(cloud, frusta, metric = (report?.optDouble("metresPerUnit", 0.0) ?: 0.0) > 0, resetCamera = initialLoad)
+            initialLoad = false
             loading = false
         }
         Box(Modifier.fillMaxSize()) {
@@ -428,12 +443,18 @@ class MainActivity : ComponentActivity() {
                 RoundButton(onClick = {
                     // Copying tens of megabytes: off the main thread.
                     lifecycleScope.launch {
-                        val name = withContext(Dispatchers.IO) { runCatching { Exporter.saveToDownloads(this@MainActivity, scan) }.getOrNull() }
+                        val name = withContext(Dispatchers.IO) { runCatching { Exporter.saveToDownloads(this@MainActivity, scan, dense) }.getOrNull() }
                         Toast.makeText(this@MainActivity, name?.let { "Saved to Downloads: $it" } ?: "Could not save", Toast.LENGTH_LONG).show()
                     }
                 }) { GlyphIcon(Glyph.Download, Ink) }
                 Spacer(Modifier.width(6.dp))
-                RoundButton(onClick = { lifecycleScope.launch(Dispatchers.IO) { runCatching { Exporter.share(this@MainActivity, scan) } } }) {
+                RoundButton(onClick = {
+                    lifecycleScope.launch {
+                        val intent = withContext(Dispatchers.IO) { runCatching { Exporter.prepareShareIntent(this@MainActivity, scan) }.getOrNull() }
+                        if (intent != null) startActivity(intent)
+                        else Toast.makeText(this@MainActivity, "Could not share scan", Toast.LENGTH_LONG).show()
+                    }
+                }) {
                     GlyphIcon(Glyph.Share, Ink)
                 }
             }
@@ -463,9 +484,10 @@ class MainActivity : ComponentActivity() {
     // ---- Scans ------------------------------------------------------------------------------
 
     @Composable
-    private fun ScansScreen() {
+    private fun ScansScreen(job: Job) {
         BackHandler { go(Screen.Capture) }
-        var scans by remember { mutableStateOf(ScanStore.list(this)) }
+        var refreshTick by remember { mutableStateOf(0) }
+        var scans by remember(job, refreshTick) { mutableStateOf(ScanStore.list(this)) }
         var confirm by remember { mutableStateOf<Scan?>(null) }
         var renaming by remember { mutableStateOf<Scan?>(null) }
         var markerDialog by remember { mutableStateOf(false) }
@@ -481,14 +503,14 @@ class MainActivity : ComponentActivity() {
             if (scans.isEmpty()) Text("No scans yet.", color = Muted, modifier = Modifier.padding(24.dp))
             LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(scans, key = { it.name }) { s -> ScanRow(s, onDelete = { confirm = s }, onRename = { renaming = s }) }
+                items(scans, key = { it.name }) { s -> ScanRow(s, job, refreshTick, onDelete = { confirm = s }, onRename = { renaming = s }) }
             }
         }
         confirm?.let { s ->
             AlertDialog(onDismissRequest = { confirm = null },
                 title = { Text("Delete scan?") },
                 text = { Text("${s.title} and its ${s.imageCount()} images will be removed from this phone.") },
-                confirmButton = { TextButton({ s.dir.deleteRecursively(); scans = ScanStore.list(this); confirm = null }) { Text("Delete", color = Stop) } },
+                confirmButton = { TextButton({ s.dir.deleteRecursively(); refreshTick++; confirm = null }) { Text("Delete", color = Stop) } },
                 dismissButton = { TextButton({ confirm = null }) { Text("Keep") } })
         }
         renaming?.let { s ->
@@ -498,7 +520,7 @@ class MainActivity : ComponentActivity() {
                 text = { OutlinedTextField(text, { text = it }, singleLine = true, placeholder = { Text(s.name) }) },
                 confirmButton = { TextButton({
                     runCatching { s.rename(text) }
-                    scans = ScanStore.list(this); renaming = null
+                    refreshTick++; renaming = null
                 }) { Text("Save") } },
                 dismissButton = { TextButton({ renaming = null }) { Text("Cancel") } })
         }
@@ -524,18 +546,32 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ScanRow(s: Scan, onDelete: () -> Unit, onRename: () -> Unit) {
-        val thumb = remember(s) {
-            s.imagesDir.listFiles()?.filter { it.name.startsWith("p_") }?.minByOrNull { it.name }?.let { f ->
-                runCatching { BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 16 })?.asImageBitmap() }.getOrNull()
+    private fun ScanRow(s: Scan, job: Job, refreshTick: Int, onDelete: () -> Unit, onRename: () -> Unit) {
+        val isRunning = (job as? Job.Running)?.scan?.dir == s.dir
+        val thumb by produceState<ImageBitmap?>(null, s.name) {
+            value = withContext(Dispatchers.IO) {
+                val rot = runCatching { JSONObject(s.meta.readText()).getJSONArray("cameras").getJSONObject(0).optInt("sensorOrientation", 90) }.getOrDefault(90)
+                s.imagesDir.listFiles()?.filter { it.name.startsWith("p_") }?.minByOrNull { it.name }?.let { f ->
+                    runCatching {
+                        val raw = BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 16 }) ?: return@runCatching null
+                        val bmp = if (rot != 0) Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, Matrix().apply { postRotate(rot.toFloat()) }, true) else raw
+                        bmp.asImageBitmap()
+                    }.getOrNull()
+                }
             }
         }
-        val report = remember(s) { s.reportJson() }
-        val title = remember(s) { s.title }
-        val bytes by produceState(-1L, s) { value = withContext(Dispatchers.IO) { s.sizeBytes() } }
+        val report = remember(s.name, isRunning, refreshTick) { if (isRunning) null else s.reportJson() }
+        val title = remember(s.name, refreshTick) { s.title }
+        val bytes by produceState(-1L, s.name, isRunning, refreshTick) { value = withContext(Dispatchers.IO) { s.sizeBytes() } }
         var menu by remember { mutableStateOf(false) }
         Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel)
-            .clickable { if (report?.optBoolean("ok") == true) go(Screen.Viewer(s)) else process(s) }.padding(10.dp),
+            .clickable {
+                when {
+                    isRunning -> go(Screen.Processing(s))
+                    report?.optBoolean("ok") == true -> go(Screen.Viewer(s))
+                    else -> process(s)
+                }
+            }.padding(10.dp),
             verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)).background(Bg)) {
                 thumb?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
@@ -543,18 +579,25 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(title, color = Ink, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(if (report?.optBoolean("ok") == true) shortSummary(report) else "${s.imageCount()} images · tap to reconstruct",
-                    color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val statusText = when {
+                    isRunning -> {
+                        val r = job as Job.Running
+                        "Reconstructing · ${r.stage} ${(r.fraction * 100).toInt()}%"
+                    }
+                    report?.optBoolean("ok") == true -> shortSummary(report)
+                    else -> "${s.imageCount()} images · tap to reconstruct"
+                }
+                Text(statusText, color = if (isRunning) Accent else Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (bytes >= 0) Text(megabytes(bytes) + if (title != s.name) " · ${s.name}" else "", color = Muted, fontSize = 11.sp)
             }
             Box {
                 RoundButton(onClick = { menu = true }) { GlyphIcon(Glyph.More, Muted, 20.dp) }
                 DropdownMenu(menu, { menu = false }) {
-                    DropdownMenuItem({ Text("Rename") }, { menu = false; onRename() })
+                    DropdownMenuItem({ Text("Rename") }, { menu = false; onRename() }, enabled = !isRunning)
                     DropdownMenuItem({ Text(if (report?.optBoolean("ok") == true) "Reconstruct again" else "Reconstruct") },
-                        { menu = false; process(s) })
+                        { menu = false; process(s) }, enabled = !isRunning)
                     DropdownMenuItem({ Text("Delete", color = Stop) }, { menu = false; onDelete() },
-                        enabled = (ReconstructionService.state.value as? Job.Running)?.scan?.dir != s.dir)
+                        enabled = !isRunning)
                 }
             }
         }

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -66,6 +67,23 @@ public:
         // Sparse long-range pairs catch revisits that are not sequential neighbours.
         for (int i = 0; i < n; i += 5)
             for (int j = i + 5; j < n; j += 5) pairs.insert({i, j});
+        auto viewDir = [&](int i) -> cv::Vec3d {
+            const auto& in = s_.images[i].input;
+            const double qw = in.imuQw, qx = in.imuQx, qy = in.imuQy, qz = in.imuQz;
+            return {2 * (qx * qz + qw * qy), 2 * (qy * qz - qw * qx), 1 - 2 * (qx * qx + qy * qy)};
+        };
+        for (int i = 0; i < n; ++i) {
+            if (!s_.images[i].input.hasImuQuat) continue;
+            const cv::Vec3d di = viewDir(i);
+            std::vector<std::pair<double, int>> near;
+            for (int j = i + w + 1; j < n; ++j) {
+                if (!s_.images[j].input.hasImuQuat) continue;
+                const double c = di.dot(viewDir(j));
+                if (c > 0.82) near.emplace_back(c, j);
+            }
+            std::sort(near.rbegin(), near.rend());
+            for (size_t k = 0; k < near.size() && k < 6; ++k) pairs.insert({i, near[k].second});
+        }
         // Simultaneous captures of the camera rig.
         for (int i = 0; i < n; ++i)
             for (int j = i + 1; j < n; ++j)
@@ -112,6 +130,7 @@ public:
                 if (x != y) parent[std::max(x, y)] = std::min(x, y);
             }
         std::unordered_map<int, int> rootToTrack;
+        std::vector<Track> raw;
         for (size_t i = 0; i < s_.images.size(); ++i)
             for (int k = 0; k < int(s_.images[i].pixels.size()); ++k) {
                 const int node = offset[i] + k;
@@ -119,26 +138,27 @@ public:
                 auto it = rootToTrack.find(root);
                 int id;
                 if (it == rootToTrack.end()) {
-                    id = int(s_.tracks.size());
+                    id = int(raw.size());
                     rootToTrack[root] = id;
-                    s_.tracks.emplace_back();
+                    raw.emplace_back();
                 } else {
                     id = it->second;
                 }
-                s_.tracks[id].elements.push_back({int(i), k});
+                raw[id].elements.push_back({int(i), k});
             }
-        // A track may not see the same image twice. When transitive matches put two keypoints
-        // of one image in a component, which one is right is unknown: drop that image from it.
-        for (size_t id = 0; id < s_.tracks.size(); ++id) {
-            auto& el = s_.tracks[id].elements;
+        s_.tracks.clear();
+        for (auto& tr : raw) {
+            auto& el = tr.elements;
+            if (el.size() < 2) continue;
             std::map<int, int> perImage;
             for (const auto& e : el) perImage[e.image]++;
             std::vector<Observation> kept;
             for (const auto& e : el)
                 if (perImage[e.image] == 1) kept.push_back(e);
-            el.swap(kept);
-            if (el.size() < 2) { el.clear(); continue; }
-            for (const auto& e : el) s_.images[e.image].track[e.keypoint] = int(id);
+            if (kept.size() < 2) continue;
+            const int id = int(s_.tracks.size());
+            for (const auto& e : kept) s_.images[e.image].track[e.keypoint] = id;
+            s_.tracks.push_back({std::move(kept), -1});
         }
     }
 
@@ -171,6 +191,13 @@ public:
                 for (int i = std::max(0, int(order_.size()) - 10); i < int(order_.size()); ++i)
                     local.variableImages.push_back(order_[i]);
                 local.fixedGaugeImage = order_[0];
+                if (order_.size() <= 10 && order_.size() > 1 && s_.images[order_[1]].registered) {
+                    const cv::Vec3d& t = s_.images[order_[1]].t;
+                    int axis = 0;
+                    for (int k = 1; k < 3; ++k) if (std::abs(t[k]) > std::abs(t[axis])) axis = k;
+                    local.scaleGaugeImage = order_[1];
+                    local.scaleGaugeAxis = axis;
+                }
                 local.maxIterations = 8;
                 bundleAdjust(s_, local);
                 filterPoints(false);
@@ -198,7 +225,9 @@ public:
         estimateMotion();
         rms_ = globalBA(true, 10);
         filterPoints(true);
-        return registered() >= 2;
+        int validPts = 0;
+        for (const auto& pt : s_.points) validPts += pt.valid;
+        return registered() >= 2 && validPts >= 20;
     }
 
     // Per-image readout motion: angular rate from the gyroscope (or, without one, from the
@@ -312,6 +341,12 @@ private:
         BAOptions o;
         o.variableImages = {p.a, p.b};
         o.fixedGaugeImage = p.a;
+        {
+            int axis = 0;
+            for (int k = 1; k < 3; ++k) if (std::abs(B.t[k]) > std::abs(B.t[axis])) axis = k;
+            o.scaleGaugeImage = p.b;
+            o.scaleGaugeAxis = axis;
+        }
         o.maxIterations = 20;
         bundleAdjust(s_, o);
         filterPoints(false);
@@ -531,7 +566,7 @@ cv::Matx33d rotationBetween(cv::Vec3d a, cv::Vec3d b) {
     cv::Vec3d axis = a.cross(b);
     const double sn = cv::norm(axis), cs = a.dot(b);
     if (sn < 1e-9) {
-        if (cs > 0) return cv::Matx33d::eye();
+        if (cs >= 0) return cv::Matx33d::eye();
         return {1, 0, 0, 0, -1, 0, 0, 0, -1};  // 180 degrees about x
     }
     axis *= std::atan2(sn, cs) / sn;
@@ -562,6 +597,31 @@ double estimateMarkerScale(const State& s, std::string& log) {
     for (size_t i = 0; i < s.images.size(); ++i)
         if (s.images[i].registered)
             for (const auto& m : s.images[i].markers) seenBy[m.first].push_back(int(i));
+    auto dltCorner = [&](int id, int c, const std::vector<int>& views, cv::Vec3d& X) -> bool {
+        if (views.size() < 3) return false;
+        cv::Mat A(int(views.size()) * 2, 4, CV_64F);
+        int row = 0;
+        for (int i : views) {
+            const Image& im = s.images[i];
+            std::vector<cv::Point2d> n;
+            undistortKeypoints(s.cameras[im.camera], {im.markers.at(id)[c]}, n);
+            const RowMotion rm = rowMotion(s, im, im.markers.at(id)[c].y, im.R);
+            const cv::Matx33d R = rm.A * im.R;
+            const cv::Vec3d t = rm.A * (im.t + rm.offset);
+            for (int k = 0; k < 4; ++k) {
+                const double p0 = k < 3 ? R(0, k) : t[0], p1 = k < 3 ? R(1, k) : t[1], p2 = k < 3 ? R(2, k) : t[2];
+                A.at<double>(row, k) = n[0].x * p2 - p0;
+                A.at<double>(row + 1, k) = n[0].y * p2 - p1;
+            }
+            row += 2;
+        }
+        cv::Mat w, u, vt;
+        cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A);
+        const double h = vt.at<double>(3, 3);
+        if (std::abs(h) < 1e-12) return false;
+        X = {vt.at<double>(3, 0) / h, vt.at<double>(3, 1) / h, vt.at<double>(3, 2) / h};
+        return true;
+    };
     std::vector<double> edges;
     int used = 0;
     for (const auto& kv : seenBy) {
@@ -569,34 +629,34 @@ double estimateMarkerScale(const State& s, std::string& log) {
         std::array<cv::Vec3d, 4> X;
         bool ok = true;
         for (int c = 0; c < 4 && ok; ++c) {
-            cv::Mat A(int(kv.second.size()) * 2, 4, CV_64F);
-            int row = 0;
-            double maxAngle = 0;
+            if (!dltCorner(kv.first, c, kv.second, X[c])) { ok = false; break; }
+            std::vector<int> inliers;
             for (int i : kv.second) {
                 const Image& im = s.images[i];
-                std::vector<cv::Point2d> n;
-                undistortKeypoints(s.cameras[im.camera], {im.markers.at(kv.first)[c]}, n);
-                for (int k = 0; k < 4; ++k) {
-                    const double p0 = k < 3 ? im.R(0, k) : im.t[0], p1 = k < 3 ? im.R(1, k) : im.t[1],
-                                 p2 = k < 3 ? im.R(2, k) : im.t[2];
-                    A.at<double>(row, k) = n[0].x * p2 - p0;
-                    A.at<double>(row + 1, k) = n[0].y * p2 - p1;
-                }
-                row += 2;
+                const cv::Point2f& obs = im.markers.at(kv.first)[c];
+                const RowMotion m = rowMotion(s, im, obs.y, im.R);
+                bool front = false;
+                const cv::Point2d uv = camToPixel(s.cameras[im.camera], m.A * (im.R * X[c] + im.t + m.offset), &front);
+                if (front && cv::norm(uv - cv::Point2d(obs)) < s.opt.maxReprojError) inliers.push_back(i);
             }
-            cv::Mat w, u, vt;
-            cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A);
-            const double h = vt.at<double>(3, 3);
-            if (std::abs(h) < 1e-12) { ok = false; break; }
-            X[c] = {vt.at<double>(3, 0) / h, vt.at<double>(3, 1) / h, vt.at<double>(3, 2) / h};
-            for (size_t a = 0; a < kv.second.size(); ++a)
-                for (size_t b = a + 1; b < kv.second.size(); ++b)
-                    maxAngle = std::max(maxAngle, triangulationAngleDeg(X[c], s.images[kv.second[a]].centre(),
-                                                                        s.images[kv.second[b]].centre()));
+            if (inliers.size() < 3) { ok = false; break; }
+            if (inliers.size() < kv.second.size() && !dltCorner(kv.first, c, inliers, X[c])) { ok = false; break; }
+            double maxAngle = 0;
+            for (size_t a = 0; a < inliers.size(); ++a)
+                for (size_t b = a + 1; b < inliers.size(); ++b)
+                    maxAngle = std::max(maxAngle, triangulationAngleDeg(X[c], s.images[inliers[a]].centre(),
+                                                                        s.images[inliers[b]].centre()));
             if (maxAngle < 3.0) ok = false;
         }
         if (!ok) continue;
-        for (int c = 0; c < 4; ++c) edges.push_back(cv::norm(X[c] - X[(c + 1) % 4]));
+        double e[4], emin = 1e30, emax = 0;
+        for (int c = 0; c < 4; ++c) {
+            e[c] = cv::norm(X[c] - X[(c + 1) % 4]);
+            emin = std::min(emin, e[c]);
+            emax = std::max(emax, e[c]);
+        }
+        if (emin <= 1e-12 || emax > 1.2 * emin) continue;
+        for (int c = 0; c < 4; ++c) edges.push_back(e[c]);
         ++used;
     }
     std::ostringstream ss;
@@ -698,14 +758,20 @@ Result Reconstructor::run(const std::string& outputDir, const std::string& image
         for (const auto& p : s.points)
             if (p.valid) sparse.push_back({cv::Vec3f(p.X), cv::Vec3f(0, 0, 0), p.color});
         res.sparsePoints = int(sparse.size());
+        std::vector<DensePoint> dense;
+        if (opt_.dense) {
+            pipe.report("Dense matching", 0.72f);
+            dense = denseReconstruct(s, progress, 0.72f, 0.98f);
+            res.densePoints = int(dense.size());
+        }
+        pipe.report("Saving model", 0.99f);
         writePly(outputDir + "/sparse.ply", sparse);
         writeColmap(s, outputDir + "/sparse/0", imageRoot);
-        pipe.report("Dense matching", 0.72f);
-
         if (opt_.dense) {
-            auto dense = denseReconstruct(s, progress, 0.72f, 0.98f);
-            res.densePoints = int(dense.size());
             writePly(outputDir + "/dense.ply", dense);
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(outputDir + "/dense.ply", ec);
         }
     } catch (const Cancelled&) {
         res.message = "cancelled";

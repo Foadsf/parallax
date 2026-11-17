@@ -22,6 +22,8 @@ object NativeCore {
 
     /** The GPU behind the vendor OpenCL driver, or why apps cannot reach it. */
     external fun openclSummary(): String
+    external fun vulkanSummary(): String
+    external fun npuSummary(): String
 
     external fun trackerReset()
 

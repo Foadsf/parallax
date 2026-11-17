@@ -88,9 +88,9 @@ class ReconstructionService : Service() {
                 }
                 !cancel
             }
-            _state.value = result.fold({ Job.Done(scan) }, { Job.Failed(scan, it.message?.lineSequence()?.firstOrNull() ?: "Failed") })
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            stopSelf(startId)
+            _state.value = result.fold({ Job.Done(scan) }, { Job.Failed(scan, it.message?.lineSequence()?.firstOrNull() ?: "Failed") })
         }
         return START_NOT_STICKY
     }

@@ -6,6 +6,7 @@
 // (Triggs et al., "Bundle Adjustment - A Modern Synthesis", 2000).
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/utility.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -77,6 +78,16 @@ cv::Matx33d expSO3(const cv::Vec3d& w) {
     return R;
 }
 
+cv::Matx33d invSym3x3(const cv::Matx33d& A) {
+    const double a00 = A(0, 0), a01 = A(0, 1), a02 = A(0, 2), a11 = A(1, 1), a12 = A(1, 2), a22 = A(2, 2);
+    const double c00 = a11 * a22 - a12 * a12, c01 = a02 * a12 - a01 * a22, c02 = a01 * a12 - a02 * a11;
+    const double c11 = a00 * a22 - a02 * a02, c12 = a01 * a02 - a00 * a12, c22 = a00 * a11 - a01 * a01;
+    const double det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (std::abs(det) <= 1e-18) return cv::Matx33d::zeros();
+    const double inv = 1.0 / det;
+    return {c00 * inv, c01 * inv, c02 * inv, c01 * inv, c11 * inv, c12 * inv, c02 * inv, c12 * inv, c22 * inv};
+}
+
 }  // namespace
 
 double bundleAdjust(State& s, const BAOptions& o) {
@@ -91,7 +102,9 @@ double bundleAdjust(State& s, const BAOptions& o) {
     std::unordered_map<int, int> intrSlot;  // camera index -> slot
     if (o.refineIntrinsics) {
         std::unordered_map<int, int> count;
-        for (const auto& kv : poseSlot) count[s.images[kv.first].camera]++;
+        std::unordered_map<int, bool> seen;
+        for (int i : o.variableImages)
+            if (s.images[i].registered && !seen[i]) { seen[i] = true; count[s.images[i].camera]++; }
         for (const auto& kv : count)
             if (kv.second >= 5) {
                 const int slot = int(intrSlot.size());
@@ -130,8 +143,10 @@ double bundleAdjust(State& s, const BAOptions& o) {
         }
 
     auto evaluate = [&](const Params& P, bool withJacobians) {
-        double cost = 0;
-        for (auto& t : terms) {
+        std::vector<double> termCosts(terms.size(), 0.0);
+        cv::parallel_for_(cv::Range(0, int(terms.size())), [&](const cv::Range& rg) {
+        for (int idx = rg.start; idx < rg.end; ++idx) {
+            auto& t = terms[idx];
             const Image& im = s.images[t.image];
             const CameraModel& c = P.cam[im.camera];
             double Jx[2][3], Ji[2][3];
@@ -144,11 +159,11 @@ double bundleAdjust(State& s, const BAOptions& o) {
             const cv::Vec3d y = R * P.X[t.point] + P.t[t.image] + m.offset;
             if (!linearise(c, m.A * y, obs, t.r, Jx, intr ? Ji : nullptr)) {
                 t.w = 0;
-                cost += huberCost(50.0, o.huberPx);  // constant penalty, keeps the cost comparable
+                termCosts[idx] = huberCost(1000.0, o.huberPx);
                 continue;
             }
             const double e = std::sqrt(t.r[0] * t.r[0] + t.r[1] * t.r[1]);
-            cost += huberCost(e, o.huberPx);
+            termCosts[idx] = huberCost(e, o.huberPx);
             if (!withJacobians) continue;
             t.w = e <= o.huberPx ? 1.0 : o.huberPx / e;
             // Chain through A: d(u,v)/dy = Jx A.
@@ -186,6 +201,9 @@ double bundleAdjust(State& s, const BAOptions& o) {
                 }
             }
         }
+        });
+        double cost = 0;
+        for (double c : termCosts) cost += c;
         return cost;
     };
 
@@ -196,14 +214,33 @@ double bundleAdjust(State& s, const BAOptions& o) {
     auto priorOf = [&](int cam) -> const CameraModel* {
         return cam < int(s.priors.size()) && s.priors[cam].calibrated ? &s.priors[cam] : nullptr;
     };
+    constexpr double kInvSigmaG2 = 1.0 / (0.02 * 0.02);
+    cv::Vec3d worldUp(0, 0, 0);
+    int upCount = 0;
+    for (const auto& im : s.images) {
+        const cv::Vec3d u(im.input.upX, im.input.upY, im.input.upZ);
+        if (im.registered && cv::norm(u) > 1e-6) { worldUp += im.R.t() * cv::normalize(u); ++upCount; }
+    }
+    const bool hasGravityPrior = upCount >= 3 && cv::norm(worldUp) > 1e-6;
+    if (hasGravityPrior) worldUp = cv::normalize(worldUp);
     auto priorCost = [&](const Params& P) {
         double c = 0;
-        for (const auto& kv : intrSlot)
+        for (const auto& kv : intrSlot) {
             if (const CameraModel* p0 = priorOf(kv.first)) {
                 const CameraModel& c1 = P.cam[kv.first];
                 c += std::pow((c1.fx / p0->fx - 1) / kSigmaF, 2) + std::pow((c1.k1 - p0->k1) / kSigmaK, 2) +
                      std::pow((c1.k2 - p0->k2) / kSigmaK, 2);
             }
+        }
+        if (hasGravityPrior) {
+            for (const auto& kv : poseSlot) {
+                const Image& im = s.images[kv.first];
+                const cv::Vec3d u(im.input.upX, im.input.upY, im.input.upZ);
+                if (cv::norm(u) <= 1e-6) continue;
+                const cv::Vec3d rg = P.R[kv.first] * worldUp - cv::normalize(u);
+                c += kInvSigmaG2 * rg.dot(rg);
+            }
+        }
         return c;
     };
 
@@ -247,6 +284,22 @@ double bundleAdjust(State& s, const BAOptions& o) {
                 C.at<double>(b + 2, b + 2) += 1 / (kSigmaK * kSigmaK);
                 gc.at<double>(b + 2) += (c1.k2 - p0->k2) / (kSigmaK * kSigmaK);
             }
+        if (hasGravityPrior) {
+            for (const auto& kv : poseSlot) {
+                const Image& im = s.images[kv.first];
+                const cv::Vec3d u(im.input.upX, im.input.upY, im.input.upZ);
+                if (cv::norm(u) <= 1e-6) continue;
+                const cv::Vec3d gCam = cur.R[kv.first] * worldUp;
+                const cv::Vec3d rg = gCam - cv::normalize(u);
+                const double Jg[3][3] = {{0, gCam[2], -gCam[1]}, {-gCam[2], 0, gCam[0]}, {gCam[1], -gCam[0], 0}};
+                const int base = 6 * kv.second;
+                for (int a = 0; a < 3; ++a) {
+                    gc.at<double>(base + a) += kInvSigmaG2 * (Jg[0][a] * rg[0] + Jg[1][a] * rg[1] + Jg[2][a] * rg[2]);
+                    for (int b = 0; b < 3; ++b)
+                        C.at<double>(base + a, base + b) += kInvSigmaG2 * (Jg[0][a] * Jg[0][b] + Jg[1][a] * Jg[1][b] + Jg[2][a] * Jg[2][b]);
+                }
+            }
+        }
         // Per point: merged coupling rows E_j (camera index -> 3-vector).
         std::vector<std::vector<std::pair<int, cv::Vec3d>>> Ej(np);
         for (const auto& t : terms) {
@@ -268,15 +321,16 @@ double bundleAdjust(State& s, const BAOptions& o) {
             cv::Mat rhs = -gc;
             for (int i = 0; i < n; ++i) S.at<double>(i, i) += lambda * C.at<double>(i, i) + 1e-9;
             std::vector<cv::Matx33d> Pinv(np);
-            for (int j = 0; j < np; ++j) {
-                if (active[j] < 2) {
-                    // Rank-deficient block (one view, or none in front): hold the point this step.
-                    Pinv[j] = cv::Matx33d::zeros();
-                    continue;
+            cv::parallel_for_(cv::Range(0, np), [&](const cv::Range& rg) {
+                for (int j = rg.start; j < rg.end; ++j) {
+                    if (active[j] < 2) { Pinv[j] = cv::Matx33d::zeros(); continue; }
+                    cv::Matx33d Pd = Pb[j];
+                    for (int a = 0; a < 3; ++a) Pd(a, a) += lambda * Pb[j](a, a) + 1e-9;
+                    Pinv[j] = invSym3x3(Pd);
                 }
-                cv::Matx33d Pd = Pb[j];
-                for (int a = 0; a < 3; ++a) Pd(a, a) += lambda * Pb[j](a, a) + 1e-9;
-                Pinv[j] = Pd.inv(cv::DECOMP_CHOLESKY);
+            });
+            for (int j = 0; j < np; ++j) {
+                if (active[j] < 2) continue;
                 const auto& list = Ej[j];
                 std::vector<cv::Vec3d> F(list.size());
                 for (size_t a = 0; a < list.size(); ++a) F[a] = Pinv[j] * list[a].second;  // P^-1 E^T
@@ -302,11 +356,13 @@ double bundleAdjust(State& s, const BAOptions& o) {
             }
             // Back-substitute points and apply the step to a candidate parameter set.
             Params cand = cur;
-            for (int j = 0; j < np; ++j) {
-                cv::Vec3d b = -gp[j];
-                for (const auto& kv : Ej[j]) b -= kv.second * dc.at<double>(kv.first);
-                cand.X[j] += Pinv[j] * b;
-            }
+            cv::parallel_for_(cv::Range(0, np), [&](const cv::Range& rg) {
+                for (int j = rg.start; j < rg.end; ++j) {
+                    cv::Vec3d b = -gp[j];
+                    for (const auto& kv : Ej[j]) b -= kv.second * dc.at<double>(kv.first);
+                    cand.X[j] += Pinv[j] * b;
+                }
+            });
             for (const auto& kv : poseSlot) {
                 const double* d = dc.ptr<double>(6 * kv.second);
                 const cv::Matx33d dR = expSO3({d[0], d[1], d[2]});

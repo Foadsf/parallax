@@ -26,12 +26,15 @@ object Reconstruction {
         }
         val up = FloatArray(imgs.size * 3)
         imgs.forEachIndexed { k, im -> im.up.copyInto(up, k * 3) }
-        val motion = DoubleArray(imgs.size * 6)
+        val motion = DoubleArray(imgs.size * 11)
         imgs.forEachIndexed { k, im ->
             val g = im.gyro
+            val q = im.imuQuat
             doubleArrayOf(im.timestampNs / 1e9, im.rsSkewNs / 1e9, g?.get(0)?.toDouble() ?: 0.0,
                 g?.get(1)?.toDouble() ?: 0.0, g?.get(2)?.toDouble() ?: 0.0, if (g != null) 1.0 else 0.0,
-            ).copyInto(motion, k * 6)
+                q?.get(0)?.toDouble() ?: 1.0, q?.get(1)?.toDouble() ?: 0.0,
+                q?.get(2)?.toDouble() ?: 0.0, q?.get(3)?.toDouble() ?: 0.0, if (q != null) 1.0 else 0.0,
+            ).copyInto(motion, k * 11)
         }
         val options = processing.asOptions(markerSizeMm)
         val json = NativeCore.reconstruct(

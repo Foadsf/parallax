@@ -10,6 +10,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core/utility.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -38,6 +39,14 @@ View denseView(const CameraModel& c, int maxSide) {
 
 cv::Mat scaledK(const CameraModel& c, double s) {
     return cv::Mat(cv::Matx33d(c.fx * s, 0, (c.cx + 0.5) * s - 0.5, 0, c.fy * s, (c.cy + 0.5) * s - 0.5, 0, 0, 1));
+}
+
+CameraModel scaledCamera(const CameraModel& c, double s) {
+    CameraModel m = c;
+    m.fx *= s; m.fy *= s;
+    m.cx = (c.cx + 0.5) * s - 0.5;
+    m.cy = (c.cy + 0.5) * s - 0.5;
+    return m;
 }
 
 double percentile(std::vector<double> v, double q) {
@@ -95,6 +104,30 @@ cv::Mat pairDepth(const State& s, int ri, int ni, const std::vector<int>& shared
     cv::Mat m1x, m1y, m2x, m2y, r1, r2;
     cv::initUndistortRectifyMap(Ka, distortionVector(ca), R1, P1, rs, CV_32FC1, m1x, m1y);
     cv::initUndistortRectifyMap(Kb, distortionVector(cb), R2, P2, rs, CV_32FC1, m2x, m2y);
+    if (A.rs || B.rs) {
+        const double zMed = f * baseline / std::max(1.0, percentile(disp, 0.5));
+        const cv::Matx33d R1t = R1m.t(), R2t = cv::Matx33d(R2).t();
+        const CameraModel caScaled = scaledCamera(ca, rv.scale), cbScaled = scaledCamera(cb, sb);
+        cv::parallel_for_(cv::Range(0, rs.height), [&](const cv::Range& rg) {
+            for (int v = rg.start; v < rg.end; ++v) {
+                float *x1 = m1x.ptr<float>(v), *y1 = m1y.ptr<float>(v);
+                float *x2 = m2x.ptr<float>(v), *y2 = m2y.ptr<float>(v);
+                for (int u = 0; u < rs.width; ++u) {
+                    const cv::Vec3d ray((u - cx) / f, (v - cy) / f, 1.0);
+                    if (A.rs) {
+                        const RowMotion rm = rowMotion(s, A, y1[u] / rv.scale, A.R);
+                        const cv::Point2d uv = camToPixel(caScaled, rm.A * (zMed * (R1t * ray) + rm.offset));
+                        x1[u] = float(uv.x); y1[u] = float(uv.y);
+                    }
+                    if (B.rs) {
+                        const RowMotion rm = rowMotion(s, B, y2[u] / sb, B.R);
+                        const cv::Point2d uv = camToPixel(cbScaled, rm.A * (zMed * (R2t * ray) + rm.offset));
+                        x2[u] = float(uv.x); y2[u] = float(uv.y);
+                    }
+                }
+            }
+        });
+    }
     cv::remap(refImg, r1, m1x, m1y, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
     cv::remap(nbImg, r2, m2x, m2y, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
     if (vertical) { cv::transpose(r1, r1); cv::transpose(r2, r2); }
@@ -115,11 +148,13 @@ cv::Mat pairDepth(const State& s, int ri, int ni, const std::vector<int>& shared
     cv::Mat d16;
     sgbm->compute(r1, r2, d16);
     // Undo the shift; invalid pixels (negative) stay negative.
-    for (int v = 0; v < d16.rows; ++v) {
+    cv::parallel_for_(cv::Range(0, d16.rows), [&](const cv::Range& rg) {
+    for (int v = rg.start; v < rg.end; ++v) {
         short* row = d16.ptr<short>(v);
         for (int u = 0; u < d16.cols; ++u)
             if (row[u] >= 0) row[u] = short(row[u] + 16 * minD);
     }
+    });
     if (flip) cv::flip(d16, d16, 1);
     if (vertical) cv::transpose(d16, d16);
 
@@ -127,7 +162,8 @@ cv::Mat pairDepth(const State& s, int ri, int ni, const std::vector<int>& shared
     // rectified position (bilinear over valid neighbours) and convert it to depth along the ray.
     cv::Mat depth(rv.size, CV_32F, cv::Scalar(0));
     const double fx = rv.K(0, 0), fy = rv.K(1, 1), ux = rv.K(0, 2), uy = rv.K(1, 2);
-    for (int y = 0; y < rv.size.height; ++y) {
+    cv::parallel_for_(cv::Range(0, rv.size.height), [&](const cv::Range& rg) {
+    for (int y = rg.start; y < rg.end; ++y) {
         float* drow = depth.ptr<float>(y);
         for (int x = 0; x < rv.size.width; ++x) {
             const cv::Vec3d ray((x - ux) / fx, (y - uy) / fy, 1.0);
@@ -152,6 +188,7 @@ cv::Mat pairDepth(const State& s, int ri, int ni, const std::vector<int>& shared
             drow[x] = float(zr / pr[2]);                    // ray has z = 1 in the reference frame
         }
     }
+    });
     if (std::getenv("PARALLAX_DEBUG")) {
         // Agreement with the sparse model: median |depth - sparse depth| / sparse depth.
         std::vector<double> rel;
@@ -205,6 +242,7 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
     // then fixed for the whole scene. (The median distance to the sparse points is not a good
     // substitute: background features put it about twice as far as the surface being matched.)
     double voxel = 0;
+    int usedRefs = 0;
 
     for (size_t r = 0; r < refs.size(); ++r) {
         if (progress && !progress("Dense matching", p0 + (p1 - p0) * float(r) / refs.size())) return {};
@@ -276,7 +314,8 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
                          percentile(rel, 0.1), percentile(rel, 0.5), percentile(rel, 0.9));
         }
         if (depths.size() == 2) {
-            for (int y = 0; y < depth.rows; ++y) {
+            cv::parallel_for_(cv::Range(0, depth.rows), [&](const cv::Range& rg) {
+            for (int y = rg.start; y < rg.end; ++y) {
                 float* d0 = depth.ptr<float>(y);
                 const float* d1 = depths[1].ptr<float>(y);
                 for (int x = 0; x < depth.cols; ++x) {
@@ -284,7 +323,9 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
                     else d0[x] = 0;
                 }
             }
+            });
         }
+        ++usedRefs;
         cv::medianBlur(depth, depth, 3);
         if (std::getenv("PARALLAX_DEBUG"))
             std::fprintf(stderr, "ref %d: maps %zu valid %d/%d final %d\n", ri, depths.size(), cv::countNonZero(depths[0]),
@@ -316,9 +357,11 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
                     std::abs(depth.at<float>(y + 1, x) - depth.at<float>(y - 1, x)) > 0.05f * zc)
                     continue;
                 const cv::Vec3d P = backproject(x, y);
-                cv::Vec3d nrm = (backproject(x + 1, y) - backproject(x - 1, y)).cross(backproject(x, y + 1) - backproject(x, y - 1));
+                const cv::Vec3d dx = (backproject(x + 1, y) - backproject(x - 1, y)) * (1.0 / zc);
+                const cv::Vec3d dy = (backproject(x, y + 1) - backproject(x, y - 1)) * (1.0 / zc);
+                cv::Vec3d nrm = dx.cross(dy);
                 const double nn = cv::norm(nrm);
-                if (nn < 1e-15) continue;
+                if (nn < 1e-12) continue;
                 nrm /= nn;
                 if (nrm.dot(P) > 0) nrm = -nrm;
                 if (-nrm.dot(P) / cv::norm(P) < 0.15) continue;  // grazing angle: unreliable
@@ -349,7 +392,7 @@ std::vector<DensePoint> denseReconstruct(const State& s, const ProgressFn& progr
             }
     }
 
-    const int minViews = refs.size() >= 3 ? 2 : 1;
+    const int minViews = usedRefs >= 3 ? 2 : 1;
     std::vector<DensePoint> out;
     out.reserve(voxels.size());
     for (const auto& v : voxels) {

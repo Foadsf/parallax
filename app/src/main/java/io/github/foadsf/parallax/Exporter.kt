@@ -11,8 +11,8 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 object Exporter {
-    /** Zips the whole scan folder (a ready COLMAP project plus PLY clouds) and opens the share sheet. */
-    fun share(ctx: Context, scan: Scan) {
+    /** Zips the whole scan folder (a ready COLMAP project plus PLY clouds) and returns the chooser Intent. */
+    fun prepareShareIntent(ctx: Context, scan: Scan): Intent {
         val dir = File(ctx.cacheDir, "exports").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
         val zip = File(dir, "parallax-${scan.name}.zip")
@@ -31,12 +31,12 @@ object Exporter {
             clipData = ClipData.newRawUri(zip.name, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        ctx.startActivity(Intent.createChooser(send, "Share scan"))
+        return Intent.createChooser(send, "Share scan")
     }
 
-    /** Copies the best point cloud to the public Downloads folder; returns its display name. */
-    fun saveToDownloads(ctx: Context, scan: Scan): String? {
-        val src = scan.bestCloud ?: return null
+    /** Copies the selected (or best) point cloud to the public Downloads folder; returns its display name. */
+    fun saveToDownloads(ctx: Context, scan: Scan, preferDense: Boolean = true): String? {
+        val src = (if (preferDense) scan.bestCloud else scan.sparse.takeIf { it.exists() } ?: scan.bestCloud) ?: return null
         val name = "parallax-${scan.name}-${src.nameWithoutExtension}.ply"
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
@@ -45,10 +45,16 @@ object Exporter {
         }
         val resolver = ctx.contentResolver
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
-        resolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } } ?: return null
-        values.clear()
-        values.put(MediaStore.Downloads.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        return name
+        return try {
+            val out = resolver.openOutputStream(uri) ?: run { resolver.delete(uri, null, null); return null }
+            out.use { stream -> src.inputStream().use { it.copyTo(stream) } }
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            name
+        } catch (e: Exception) {
+            runCatching { resolver.delete(uri, null, null) }
+            null
+        }
     }
 }

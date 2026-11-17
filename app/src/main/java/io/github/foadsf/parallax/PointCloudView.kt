@@ -50,6 +50,7 @@ class Cloud(val data: ByteBuffer, val count: Int, val centre: FloatArray, val ra
                     if (line.startsWith("element vertex")) n = line.substring(15).trim().toInt()
                     if (line.toString().trim() == "end_header" || header.length > 4096) break
                 }
+                if (n <= 0) return null
                 val raw = ByteArray(n * 27)
                 input.readFully(raw)
                 val src = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
@@ -188,8 +189,8 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     }
 
     /** [cams]: frustum line segments; [metric]: the model is in metres (grid in 10 cm steps). */
-    fun show(c: Cloud?, cams: Cloud?, metric: Boolean = false) {
-        if (c != null) {
+    fun show(c: Cloud?, cams: Cloud?, metric: Boolean = false, resetCamera: Boolean = true) {
+        if (c != null && resetCamera) {
             home = c.centre.copyOf()
             target = home.copyOf()
             homeDistance = c.radius * 3.2f
@@ -303,6 +304,7 @@ class PointCloudView(context: Context) : GLSurfaceView(context), GLSurfaceView.R
 
     private fun upload(slot: Int, c: Cloud?) {
         if (c == null) return
+        c.data.rewind()
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[slot])
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, c.count * STRIDE, c.data, GLES30.GL_STATIC_DRAW)
     }
